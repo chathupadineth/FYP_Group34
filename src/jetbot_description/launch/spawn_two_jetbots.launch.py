@@ -21,7 +21,10 @@ def generate_launch_description():
     )
 
     def make_robot_group(name, x, y, z, yaw):
-        robot_description = ParameterValue(Command(['xacro ', xacro_file]), value_type=str)
+        robot_description = ParameterValue(
+    Command(['xacro ', xacro_file, ' botname:=', name]),
+    value_type=str
+)
 
         robot_state_publisher = Node(
             package='robot_state_publisher',

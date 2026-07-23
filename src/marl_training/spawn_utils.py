@@ -49,3 +49,29 @@ def sample_robot_and_goal(min_separation=0.5):
         if dist >= min_separation:
             return robot_pos, goal_pos
     raise RuntimeError("Could not find a valid goal position with sufficient separation")
+
+def sample_two_agents_and_goals(min_agent_separation=0.5, min_goal_separation=0.5):
+    """Sample start + goal positions for 2 agents, ensuring no unwanted overlap."""
+    agent_0_pos = sample_valid_position()
+
+    for _ in range(100):
+        agent_1_pos = sample_valid_position()
+        dist = ((agent_1_pos[0]-agent_0_pos[0])**2 + (agent_1_pos[1]-agent_0_pos[1])**2) ** 0.5
+        if dist >= min_agent_separation:
+            break
+    else:
+        raise RuntimeError("Could not find valid agent_1 start position")
+
+    goal_0 = _sample_goal_away_from(agent_0_pos, min_goal_separation)
+    goal_1 = _sample_goal_away_from(agent_1_pos, min_goal_separation)
+
+    return agent_0_pos, agent_1_pos, goal_0, goal_1
+
+
+def _sample_goal_away_from(pos, min_separation):
+    for _ in range(100):
+        goal = sample_valid_position()
+        dist = ((goal[0]-pos[0])**2 + (goal[1]-pos[1])**2) ** 0.5
+        if dist >= min_separation:
+            return goal
+    raise RuntimeError("Could not find valid goal position")

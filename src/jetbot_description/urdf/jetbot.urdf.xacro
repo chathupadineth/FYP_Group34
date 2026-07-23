@@ -1,6 +1,9 @@
 <?xml version="1.0"?>
 <robot name="jetbot" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
+  <xacro:arg name="botname" default="jetbot"/>
+  <xacro:property name="botname" value="$(arg botname)"/>
+
   <!-- ===================== Base ===================== -->
   <link name="base_link">
     <visual>
@@ -146,7 +149,7 @@
       <wheel_separation>0.1592</wheel_separation>
       <wheel_radius>0.033</wheel_radius>
       <odom_publish_frequency>30</odom_publish_frequency>
-      <topic>cmd_vel</topic>
+      <topic>${botname}/cmd_vel</topic>
     </plugin>
     <plugin filename="gz-sim-pose-publisher-system" name="gz::sim::systems::PosePublisher">
       <publish_link_pose>true</publish_link_pose>
@@ -157,7 +160,7 @@
   <!-- ===================== Gazebo Sim: LIDAR Sensor (real RPLIDAR A1 specs) ===================== -->
   <gazebo reference="lidar_link">
     <sensor name="lidar" type="gpu_lidar">
-      <topic>scan</topic>
+      <topic>${botname}/scan</topic>
       <update_rate>5.5</update_rate>
       <lidar>
         <scan>
@@ -178,5 +181,4 @@
       <visualize>true</visualize>
     </sensor>
   </gazebo>
-
 </robot>
