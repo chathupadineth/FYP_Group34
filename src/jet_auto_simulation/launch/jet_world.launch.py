@@ -9,7 +9,7 @@ def generate_launch_description():
     world_path = os.path.join(pkg_share, 'worlds', 'jet_world.sdf')
 
     gazebo = ExecuteProcess(
-        cmd=['ign', 'gazebo', world_path],
+        cmd=['ign', 'gazebo', world_path, '-r'],
         output='screen'
     )
 

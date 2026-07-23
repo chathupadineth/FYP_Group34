@@ -1,4 +1,5 @@
 import os
+from launch_ros.actions import Node
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, GroupAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -57,9 +58,17 @@ def generate_launch_description():
     # Two robots, distinct namespaces and spawn positions
     robot_1 = make_robot_group('jb_0', x=1.5, y=0.0, z=0.815, yaw=0.0)
     robot_2 = make_robot_group('jb_1', x=0.5, y=0.0, z=0.815, yaw=0.0)
+    bridge_config = os.path.join(jetbot_desc_share, 'config', 'bridge_config.yaml')
+    bridge_node = Node(
+        package='ros_gz_bridge',
+        executable='parameter_bridge',
+        parameters=[{'config_file': bridge_config}],
+        output='screen'
+    )    
 
     return LaunchDescription([
         world_launch,
         robot_1,
-        robot_2
+        robot_2,
+        bridge_node   
     ])
