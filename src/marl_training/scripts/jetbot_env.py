@@ -14,20 +14,18 @@ NUM_LIDAR_SECTORS = 12
 MAX_LIDAR_RANGE = 12.0
 MAX_EPISODE_STEPS = 200
 GOAL_REACHED_DIST = 0.15
-COLLISION_DIST = 0.12   # closest LIDAR reading considered a collision
-WORLD_NAME = "empty"    # matches <world name='empty'> in jet_world.sdf
+COLLISION_DIST = 0.12
+WORLD_NAME = "empty"
 
 DISCRETE_ACTIONS = {
-    0: (0.15, 0.0),    # forward
-    1: (0.05, 0.6),    # turn left
-    2: (0.05, -0.6),   # turn right
-    3: (0.0, 0.0),     # stop
+    0: (0.15, 0.0),
+    1: (0.05, 0.6),
+    2: (0.05, -0.6),
+    3: (0.0, 0.0),
 }
 
 
 class JetBotAgent:
-    """Holds ROS2 pub/sub state for a single robot namespace."""
-
     def __init__(self, node: Node, name: str):
         self.name = name
         self.latest_scan = None
@@ -36,7 +34,7 @@ class JetBotAgent:
         self.scan_sub = node.create_subscription(
             LaserScan, f'/{name}/scan', self._scan_cb, 10)
         self.odom_sub = node.create_subscription(
-            Odometry, f'/{name}/odom', self._odom_cb, 10)
+            Odometry, f'/model/{name}/odometry', self._odom_cb, 10)
         self.cmd_pub = node.create_publisher(
             Twist, f'/{name}/cmd_vel', 10)
 
@@ -69,7 +67,6 @@ class MultiJetBotEnv:
         self.step_count = 0
 
     def _spin_until_fresh(self, timeout_sec=2.0):
-        """Block until both agents have received at least one scan+odom message."""
         start = time.time()
         for agent in self.agents.values():
             agent.latest_scan = None
@@ -80,18 +77,18 @@ class MultiJetBotEnv:
                 raise TimeoutError("Timed out waiting for fresh sensor data")
 
     def _teleport(self, name, x, y, z=0.815, yaw=0.0):
-        """Teleport an entity using gz service call (Gazebo Fortress)."""
+        """Teleport an entity using ign service call (Gazebo Fortress)."""
         qw = math.cos(yaw / 2.0)
         qz = math.sin(yaw / 2.0)
         req = (
             f'name: "{name}", position: {{x: {x}, y: {y}, z: {z}}}, '
-            f'orientation: {{w: {qw}, z: {qz}}}'
+            f'orientation: {{x: 0.0, y: 0.0, z: {qz}, w: {qw}}}'
         )
         subprocess.run([
-            'gz', 'service', '-s', f'/world/{WORLD_NAME}/set_pose',
+            'ign', 'service', '-s', f'/world/{WORLD_NAME}/set_pose',
             '--reqtype', 'ignition.msgs.Pose',
             '--reptype', 'ignition.msgs.Boolean',
-            '--timeout', '1000',
+            '--timeout', '2000',
             '--req', req
         ], capture_output=True)
 
@@ -104,17 +101,16 @@ class MultiJetBotEnv:
         self.goals['jb_0'] = goal0
         self.goals['jb_1'] = goal1
 
-        time.sleep(0.2)  # let physics settle after teleport
+        time.sleep(0.2)
         self._spin_until_fresh()
 
-        return {name: self._build_observation(name) for name in self.agents}
+        return {name: self._build_observation(name)[0] for name in self.agents}
 
     def _build_observation(self, name):
         agent = self.agents[name]
         scan = agent.latest_scan
         odom = agent.latest_odom
 
-        # Downsample LIDAR into NUM_LIDAR_SECTORS
         ranges = scan.ranges
         n = len(ranges)
         sector_size = n // NUM_LIDAR_SECTORS
@@ -125,7 +121,6 @@ class MultiJetBotEnv:
             min_r = min(chunk) if chunk else MAX_LIDAR_RANGE
             sectors.append(min(min_r, MAX_LIDAR_RANGE) / MAX_LIDAR_RANGE)
 
-        # Goal distance/angle
         gx, gy = self.goals[name]
         px = odom.pose.pose.position.x
         py = odom.pose.pose.position.y
@@ -133,7 +128,6 @@ class MultiJetBotEnv:
         dist = math.sqrt(dx**2 + dy**2)
         goal_angle = math.atan2(dy, dx)
 
-        # crude yaw extraction from quaternion (z, w only, assumes flat motion)
         qz = odom.pose.pose.orientation.z
         qw = odom.pose.pose.orientation.w
         yaw = 2 * math.atan2(qz, qw)
