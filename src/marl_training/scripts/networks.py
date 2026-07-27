@@ -30,17 +30,13 @@ class Critic(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(CENTRAL_OBS_DIM, HIDDEN_DIM)
         self.rnn = nn.GRU(HIDDEN_DIM, HIDDEN_DIM, batch_first=True)
-        self.fc_out = nn.Linear(HIDDEN_DIM, 1)
+        self.fc_out = nn.Linear(HIDDEN_DIM, 2)   # <-- changed from 1 to 2
 
     def forward(self, joint_obs, hidden_state):
-        """
-        joint_obs: (batch, seq_len, CENTRAL_OBS_DIM) -- both agents' obs concatenated
-        hidden_state: (1, batch, HIDDEN_DIM)
-        """
         x = torch.relu(self.fc1(joint_obs))
         x, new_hidden = self.rnn(x, hidden_state)
-        value = self.fc_out(x)
-        return value, new_hidden
+        values = self.fc_out(x)   # shape: (batch, seq_len, 2)
+        return values, new_hidden
 
     def init_hidden(self, batch_size):
-        return torch.zeros(1, batch_size, HIDDEN_DIM)  
+        return torch.zeros(1, batch_size, HIDDEN_DIM)
