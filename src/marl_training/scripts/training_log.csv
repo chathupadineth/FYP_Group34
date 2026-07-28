@@ -1,1 +1,3 @@
 update,avg_reward_jb0,avg_reward_jb1,episodes_completed,goals_reached,collisions,critic_loss,actor_loss,elapsed_sec
+1,0.0,0.0,0,0,352,44816.3671875,-0.03964797407388687,70.16846442222595
+2,0.0,0.0,0,0,400,49640.93359375,-0.03366579860448837,139.64300155639648

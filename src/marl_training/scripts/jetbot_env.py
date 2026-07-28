@@ -67,6 +67,7 @@ class MultiJetBotEnv:
         self.goals = {'jb_0': None, 'jb_1': None}
         self.step_count = 0
         self.agent_done = {'jb_0': False, 'jb_1': False}
+        self.agent_colliding = {'jb_0': False, 'jb_1': False}
 
     def _spin_until_fresh(self, timeout_sec=2.0):
         start = time.time()
@@ -97,6 +98,7 @@ class MultiJetBotEnv:
     def reset(self):
         self.step_count = 0
         self.agent_done = {'jb_0': False, 'jb_1': False}
+        self.agent_colliding = {'jb_0': False, 'jb_1': False}
         pos0, pos1, goal0, goal1 = sample_two_agents_and_goals()
 
         self._teleport('jb_0', pos0[0], pos0[1])
@@ -150,7 +152,7 @@ class MultiJetBotEnv:
     def step(self, actions: dict):
         for name, action_id in actions.items():
             if self.agent_done[name]:
-                self.agents[name].publish_action(3)  # only goal-reached agents freeze
+                self.agents[name].publish_action(3)
             else:
                 self.agents[name].publish_action(action_id)
 
@@ -171,14 +173,20 @@ class MultiJetBotEnv:
             obs, dist, min_lidar = self._build_observation(name)
             reward = -0.01
             done = False
+            is_colliding_now = (min_lidar * MAX_LIDAR_RANGE) <= COLLISION_DIST
 
             if dist <= GOAL_REACHED_DIST:
                 reward = 10.0
                 done = True
-            elif min_lidar * MAX_LIDAR_RANGE <= COLLISION_DIST:
-                reward = -10.0
-                # done stays False -- robot keeps acting and can try again (Option B)
-            elif self.step_count >= MAX_EPISODE_STEPS:
+            elif is_colliding_now:
+                if self.agent_colliding[name]:
+                    reward = -1.0   # ongoing contact, already penalized once
+                else:
+                    reward = -10.0  # first contact this collision event
+
+            self.agent_colliding[name] = is_colliding_now
+
+            if not done and self.step_count >= MAX_EPISODE_STEPS:
                 done = True
 
             observations[name] = obs

@@ -23,3 +23,16 @@ cd ~/fyp_ws
 colcon build
 source install/setup.bash
 ros2 launch jetbot_description spawn_two_jetbots.launch.py
+
+Terminal 1: Launch Gazebo + robots + bridge
+bash
+cd ~/fyp_ws
+source install/setup.bash
+ros2 launch jetbot_description spawn_two_jetbots.launch.py
+
+Leave this running — check the Gazebo window opens, shows both robots, and isn't paused/flickering.
+
+Terminal 2: Run training (after the 3 fixes are saved)
+bash
+cd ~/fyp_ws/src/marl_training/scripts
+python3 train_mappo.py
