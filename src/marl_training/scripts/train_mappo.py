@@ -73,9 +73,9 @@ def main():
             values, _ = critic(joint_obs_tensor, critic_hidden)
             values = values.squeeze().tolist()
 
-            next_obs, rewards, dones = env.step(actions)
+            next_obs, rewards, dones = env.step(actions)   
 
-            episode_done = any(dones.values())
+            episode_done = all(dones.values())
             buffer.add(obs, joint_obs, actions, log_probs, rewards, values, episode_done)
 
             for name in ['jb_0', 'jb_1']:

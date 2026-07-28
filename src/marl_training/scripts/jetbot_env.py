@@ -66,6 +66,7 @@ class MultiJetBotEnv:
         }
         self.goals = {'jb_0': None, 'jb_1': None}
         self.step_count = 0
+        self.agent_done = {'jb_0': False, 'jb_1': False}
 
     def _spin_until_fresh(self, timeout_sec=2.0):
         start = time.time()
@@ -95,6 +96,7 @@ class MultiJetBotEnv:
 
     def reset(self):
         self.step_count = 0
+        self.agent_done = {'jb_0': False, 'jb_1': False}
         pos0, pos1, goal0, goal1 = sample_two_agents_and_goals()
 
         self._teleport('jb_0', pos0[0], pos0[1])
@@ -147,7 +149,10 @@ class MultiJetBotEnv:
 
     def step(self, actions: dict):
         for name, action_id in actions.items():
-            self.agents[name].publish_action(action_id)
+            if self.agent_done[name]:
+                self.agents[name].publish_action(3)  # only goal-reached agents freeze
+            else:
+                self.agents[name].publish_action(action_id)
 
         for _ in range(ACTION_REPEAT):
             self._spin_until_fresh()
@@ -156,6 +161,13 @@ class MultiJetBotEnv:
 
         observations, rewards, dones = {}, {}, {}
         for name in self.agents:
+            if self.agent_done[name]:
+                obs, _, _ = self._build_observation(name)
+                observations[name] = obs
+                rewards[name] = 0.0
+                dones[name] = True
+                continue
+
             obs, dist, min_lidar = self._build_observation(name)
             reward = -0.01
             done = False
@@ -165,13 +177,15 @@ class MultiJetBotEnv:
                 done = True
             elif min_lidar * MAX_LIDAR_RANGE <= COLLISION_DIST:
                 reward = -10.0
-                done = True
+                # done stays False -- robot keeps acting and can try again (Option B)
             elif self.step_count >= MAX_EPISODE_STEPS:
                 done = True
 
             observations[name] = obs
             rewards[name] = reward
             dones[name] = done
+            if done:
+                self.agent_done[name] = True
 
         return observations, rewards, dones
 

@@ -13,7 +13,7 @@ OBSTACLES = [
     (2.21225,  -0.424662, 0.425, 0.275),   # obstacle_box_2 (size 0.85 x 0.55)
 ]
 
-ROBOT_CLEARANCE = 0.15  # half of robot's chassis length, adds safety margin
+ROBOT_CLEARANCE = 0.22  # half of robot's chassis length, adds safety margin
 
 
 def is_position_valid(x, y):
@@ -30,7 +30,7 @@ def is_position_valid(x, y):
     return True
 
 
-def sample_valid_position(max_attempts=100):
+def sample_valid_position(max_attempts=300):
     """Randomly sample a collision-free (x, y) position on the platform."""
     for _ in range(max_attempts):
         x = random.uniform(PLATFORM_X_MIN, PLATFORM_X_MAX)
