@@ -22,8 +22,7 @@ DISCRETE_ACTIONS = {
     0: (0.15, 0.0),    # forward
     1: (0.05, 0.6),    # turn left
     2: (0.05, -0.6),   # turn right
-    3: (0.0, 0.0),     # stop
-    4: (-0.15, 0.0),   # backward
+    3: (-0.15, 0.0),   # backward
 }
 
 
@@ -54,6 +53,12 @@ class JetBotAgent:
         twist = Twist()
         twist.linear.x = linear
         twist.angular.z = angular
+        self.cmd_pub.publish(twist)
+
+    def publish_stop(self):
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
         self.cmd_pub.publish(twist)
 
 
@@ -155,7 +160,7 @@ class MultiJetBotEnv:
     def step(self, actions: dict):
         for name, action_id in actions.items():
             if self.agent_done[name]:
-                self.agents[name].publish_action(3)
+                self.agents[name].publish_stop()
             else:
                 self.agents[name].publish_action(action_id)
 
