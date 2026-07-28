@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 OBS_DIM = 16
-ACTION_DIM = 4
+ACTION_DIM = 5
 HIDDEN_DIM = 64
 
 

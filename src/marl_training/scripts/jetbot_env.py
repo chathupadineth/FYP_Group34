@@ -19,10 +19,11 @@ ACTION_REPEAT = 3
 WORLD_NAME = "empty"
 
 DISCRETE_ACTIONS = {
-    0: (0.15, 0.0),
-    1: (0.05, 0.6),
-    2: (0.05, -0.6),
-    3: (0.0, 0.0),
+    0: (0.15, 0.0),    # forward
+    1: (0.05, 0.6),    # turn left
+    2: (0.05, -0.6),   # turn right
+    3: (0.0, 0.0),     # stop
+    4: (-0.15, 0.0),   # backward
 }
 
 
@@ -68,6 +69,7 @@ class MultiJetBotEnv:
         self.step_count = 0
         self.agent_done = {'jb_0': False, 'jb_1': False}
         self.agent_colliding = {'jb_0': False, 'jb_1': False}
+        self.prev_distance = {'jb_0': None, 'jb_1': None}
 
     def _spin_until_fresh(self, timeout_sec=2.0):
         start = time.time()
@@ -99,6 +101,7 @@ class MultiJetBotEnv:
         self.step_count = 0
         self.agent_done = {'jb_0': False, 'jb_1': False}
         self.agent_colliding = {'jb_0': False, 'jb_1': False}
+        self.prev_distance = {'jb_0': None, 'jb_1': None}
         pos0, pos1, goal0, goal1 = sample_two_agents_and_goals()
 
         self._teleport('jb_0', pos0[0], pos0[1])
@@ -171,7 +174,14 @@ class MultiJetBotEnv:
                 continue
 
             obs, dist, min_lidar = self._build_observation(name)
-            reward = -0.01
+
+            if self.prev_distance[name] is None:
+                shaping_reward = 0.0
+            else:
+                shaping_reward = 5.0 * (self.prev_distance[name] - dist)
+            self.prev_distance[name] = dist
+
+            reward = shaping_reward - 0.01
             done = False
             is_colliding_now = (min_lidar * MAX_LIDAR_RANGE) <= COLLISION_DIST
 
@@ -180,9 +190,9 @@ class MultiJetBotEnv:
                 done = True
             elif is_colliding_now:
                 if self.agent_colliding[name]:
-                    reward = -1.0   # ongoing contact, already penalized once
+                    reward = -1.0
                 else:
-                    reward = -10.0  # first contact this collision event
+                    reward = -10.0
 
             self.agent_colliding[name] = is_colliding_now
 
