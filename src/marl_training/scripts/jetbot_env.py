@@ -14,7 +14,8 @@ NUM_LIDAR_SECTORS = 12
 MAX_LIDAR_RANGE = 12.0
 MAX_EPISODE_STEPS = 200
 GOAL_REACHED_DIST = 0.15
-COLLISION_DIST = 0.12
+COLLISION_DIST = 0.20
+ACTION_REPEAT = 3  
 WORLD_NAME = "empty"
 
 DISCRETE_ACTIONS = {
@@ -148,7 +149,9 @@ class MultiJetBotEnv:
         for name, action_id in actions.items():
             self.agents[name].publish_action(action_id)
 
-        self._spin_until_fresh()
+        for _ in range(ACTION_REPEAT):
+            self._spin_until_fresh()
+
         self.step_count += 1
 
         observations, rewards, dones = {}, {}, {}
