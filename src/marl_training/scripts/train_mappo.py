@@ -125,6 +125,9 @@ def main():
         if update % CHECKPOINT_EVERY == 0:
             save_checkpoint(actor, critic, update, tag=f'update{update}')
 
+    for name in ['jb_0', 'jb_1']:
+        env.agents[name].publish_action(3)  # 3 = stop
+
     log_file.close()
     env.close()
     print("\nTraining complete.")
