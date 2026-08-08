@@ -10,8 +10,16 @@ from buffer import RolloutBuffer
 from gae import compute_gae
 from ppo_update import ppo_update
 
+def get_curriculum_max_goal_distance(update_num):
+    if update_num <= 15:
+        return 1.0
+    elif update_num <= 30:
+        return 2.0
+    else:
+        return None  # full platform range
+
 ROLLOUT_LENGTH = 200      # steps collected per update (~1 episode's worth)
-NUM_UPDATES = 50          # short test run
+NUM_UPDATES = 300          # short test run
 CHECKPOINT_EVERY = 10
 LEARNING_RATE = 5e-4
 
@@ -24,8 +32,26 @@ os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 def save_checkpoint(actor, critic, update_num, tag='latest'):
     torch.save(actor.state_dict(), os.path.join(CHECKPOINT_DIR, f'actor_{tag}.pt'))
     torch.save(critic.state_dict(), os.path.join(CHECKPOINT_DIR, f'critic_{tag}.pt'))
+    if tag == 'latest':
+        with open(os.path.join(CHECKPOINT_DIR, 'last_update.txt'), 'w') as f:
+            f.write(str(update_num))
     print(f"Saved checkpoint: {tag} (update {update_num})")
 
+def load_checkpoint(actor, critic):
+    actor_path = os.path.join(CHECKPOINT_DIR, 'actor_latest.pt')
+    critic_path = os.path.join(CHECKPOINT_DIR, 'critic_latest.pt')
+    last_update_path = os.path.join(CHECKPOINT_DIR, 'last_update.txt')
+
+    if os.path.exists(actor_path) and os.path.exists(critic_path) and os.path.exists(last_update_path):
+        actor.load_state_dict(torch.load(actor_path))
+        critic.load_state_dict(torch.load(critic_path))
+        with open(last_update_path, 'r') as f:
+            last_update = int(f.read().strip())
+        print(f"Resumed from checkpoint at update {last_update}")
+        return last_update
+    else:
+        print("No checkpoint found, starting fresh")
+        return 0
 
 def main():
     actor = Actor()
@@ -33,20 +59,24 @@ def main():
     actor_optimizer = optim.Adam(actor.parameters(), lr=LEARNING_RATE)
     critic_optimizer = optim.Adam(critic.parameters(), lr=LEARNING_RATE)
 
+    start_update = load_checkpoint(actor, critic)
+
     env = MultiJetBotEnv()
 
-    log_file = open(LOG_PATH, 'w', newline='')
+    log_file_exists = os.path.exists(LOG_PATH)
+    log_file = open(LOG_PATH, 'a' if log_file_exists else 'w', newline='')
     log_writer = csv.writer(log_file)
-    log_writer.writerow(['update', 'avg_reward_jb0', 'avg_reward_jb1',
-                          'episodes_completed', 'goals_reached', 'collisions',
-                          'critic_loss', 'actor_loss', 'elapsed_sec'])
+    if not log_file_exists:
+        log_writer.writerow(['update', 'avg_reward_jb0', 'avg_reward_jb1',
+                              'episodes_completed', 'goals_reached', 'collisions',
+                              'critic_loss', 'actor_loss', 'elapsed_sec'])
 
     print("Initial reset...")
-    obs = env.reset()
+    obs = env.reset(max_goal_distance=get_curriculum_max_goal_distance(start_update + 1))
 
     start_time = time.time()
 
-    for update in range(1, NUM_UPDATES + 1):
+    for update in range(start_update + 1, NUM_UPDATES + 1):
         buffer = RolloutBuffer()
 
         episode_rewards = {'jb_0': [], 'jb_1': []}
@@ -91,7 +121,7 @@ def main():
                 for name in ['jb_0', 'jb_1']:
                     episode_rewards[name].append(current_ep_reward[name])
                     current_ep_reward[name] = 0.0
-                obs = env.reset()
+                obs = env.reset(max_goal_distance=get_curriculum_max_goal_distance(update))
 
         # ----- Compute GAE per agent -----
         advantages = {}
@@ -120,7 +150,7 @@ def main():
         log_writer.writerow([update, avg_r0, avg_r1, len(episode_rewards['jb_0']),
                               goals_reached, collisions, critic_loss, actor_loss, elapsed])
         log_file.flush()
-
+        os.fsync(log_file.fileno())
         save_checkpoint(actor, critic, update, tag='latest')
         if update % CHECKPOINT_EVERY == 0:
             save_checkpoint(actor, critic, update, tag=f'update{update}')

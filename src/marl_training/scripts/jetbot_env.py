@@ -102,13 +102,13 @@ class MultiJetBotEnv:
             '--req', req
         ], capture_output=True)
 
-    def reset(self):
+    def reset(self, max_goal_distance=None):
         self.step_count = 0
         self.agent_done = {'jb_0': False, 'jb_1': False}
         self.agent_colliding = {'jb_0': False, 'jb_1': False}
         self.prev_distance = {'jb_0': None, 'jb_1': None}
-        pos0, pos1, goal0, goal1 = sample_two_agents_and_goals()
-
+        pos0, pos1, goal0, goal1 = sample_two_agents_and_goals(max_goal_distance=max_goal_distance)
+        
         self._teleport('jb_0', pos0[0], pos0[1])
         self._teleport('jb_1', pos1[0], pos1[1])
         self.goals['jb_0'] = goal0
