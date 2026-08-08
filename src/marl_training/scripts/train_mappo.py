@@ -11,15 +11,10 @@ from gae import compute_gae
 from ppo_update import ppo_update
 
 def get_curriculum_max_goal_distance(update_num):
-    if update_num <= 15:
-        return 1.0
-    elif update_num <= 30:
-        return 2.0
-    else:
-        return None  # full platform range
+    return 1.0   # close goals for this entire 50-update test run
 
 ROLLOUT_LENGTH = 200      # steps collected per update (~1 episode's worth)
-NUM_UPDATES = 300          # short test run
+NUM_UPDATES = 50          # short test run
 CHECKPOINT_EVERY = 10
 LEARNING_RATE = 5e-4
 
