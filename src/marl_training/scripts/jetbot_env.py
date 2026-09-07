@@ -15,6 +15,7 @@ MAX_LIDAR_RANGE = 12.0
 MAX_EPISODE_STEPS = 200
 GOAL_REACHED_DIST = 0.15
 COLLISION_DIST = 0.20
+FORWARD_HALF_ANGLE = math.radians(75)  # ±75° cone in front counts as "forward-facing" for collisions
 ACTION_REPEAT = 3  
 WORLD_NAME = "empty"
 
@@ -127,12 +128,25 @@ class MultiJetBotEnv:
         ranges = scan.ranges
         n = len(ranges)
         sector_size = n // NUM_LIDAR_SECTORS
+        angle_increment = scan.angle_increment
+        angle_min = scan.angle_min
+
         sectors = []
+        forward_min_dist = MAX_LIDAR_RANGE
         for i in range(NUM_LIDAR_SECTORS):
             chunk = ranges[i*sector_size:(i+1)*sector_size]
             chunk = [r for r in chunk if not math.isinf(r) and not math.isnan(r)]
             min_r = min(chunk) if chunk else MAX_LIDAR_RANGE
-            sectors.append(min(min_r, MAX_LIDAR_RANGE) / MAX_LIDAR_RANGE)
+            min_r = min(min_r, MAX_LIDAR_RANGE)
+            sectors.append(min_r / MAX_LIDAR_RANGE)
+
+            sector_center = angle_min + (i * sector_size + sector_size / 2.0) * angle_increment
+            sector_center = math.atan2(math.sin(sector_center), math.cos(sector_center))
+            if abs(sector_center) <= FORWARD_HALF_ANGLE:
+                forward_min_dist = min(forward_min_dist, min_r)
+
+        if forward_min_dist <= COLLISION_DIST:
+            print(f"[{name}] COLLISION triggered (forward-facing) — dist={forward_min_dist:.3f}m")
 
         gx, gy = self.goals[name]
         px = odom.pose.pose.position.x
@@ -155,7 +169,7 @@ class MultiJetBotEnv:
             vx,
             vz,
         ]
-        return obs, dist, min(sectors)
+        return obs, dist, forward_min_dist / MAX_LIDAR_RANGE
 
     def step(self, actions: dict):
         for name, action_id in actions.items():

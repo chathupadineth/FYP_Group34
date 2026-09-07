@@ -9,56 +9,74 @@ PPO_EPOCHS = 10
 LEARNING_RATE = 5e-4
 
 
+def _forward_actor_sequence(actor, obs_seq, dones):
+    """Runs the actor's GRU one step at a time in order, carrying hidden
+    state forward across steps and resetting after each episode boundary --
+    matching how hidden state is handled during rollout collection."""
+    hidden = actor.init_hidden(1)
+    logits_list = []
+    for t in range(obs_seq.shape[0]):
+        obs_t = obs_seq[t].view(1, 1, -1)
+        logit_t, hidden = actor(obs_t, hidden)
+        logits_list.append(logit_t.view(-1))
+        if dones[t]:
+            hidden = actor.init_hidden(1)
+    return torch.stack(logits_list, dim=0)
+
+
+def _forward_critic_sequence(critic, joint_obs_seq, dones):
+    """Same idea as _forward_actor_sequence, for the centralized critic."""
+    hidden = critic.init_hidden(1)
+    values_list = []
+    for t in range(joint_obs_seq.shape[0]):
+        obs_t = joint_obs_seq[t].view(1, 1, -1)
+        value_t, hidden = critic(obs_t, hidden)
+        values_list.append(value_t.view(-1))
+        if dones[t]:
+            hidden = critic.init_hidden(1)
+    return torch.stack(values_list, dim=0)
+
+
 def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer,
                advantages, returns, agent_names=('jb_0', 'jb_1')):
     """
     advantages, returns: dicts keyed by agent name, each a list matching buffer length
     """
-    batch_size = len(buffer)
+    joint_obs = torch.tensor(buffer.joint_obs, dtype=torch.float32)  # (batch, 32)
+    dones = buffer.dones  # list[bool], episode boundaries shared by both agents
 
-    # Prepare tensors (treating each step independently: seq_len=1 per item)
-    joint_obs = torch.tensor(buffer.joint_obs, dtype=torch.float32).unsqueeze(1)  # (batch, 1, 32)
+    critic_loss = None
+    actor_loss_total = None
 
     for epoch in range(PPO_EPOCHS):
-        actor_hidden = actor.init_hidden(batch_size)
-        critic_hidden = critic.init_hidden(batch_size)
-
         # ----- Critic update -----
-        values, _ = critic(joint_obs, critic_hidden)  # (batch, 1, 2)
-        values = values.squeeze(1)  # (batch, 2)
-
+        values = _forward_critic_sequence(critic, joint_obs, dones)  # (batch, 2)
         critic_loss = 0
         for i, name in enumerate(agent_names):
             target_returns = torch.tensor(returns[name], dtype=torch.float32)
             critic_loss += torch.nn.functional.mse_loss(values[:, i], target_returns)
-
         critic_optimizer.zero_grad()
         critic_loss.backward()
         torch.nn.utils.clip_grad_norm_(critic.parameters(), MAX_GRAD_NORM)
         critic_optimizer.step()
 
-        # ----- Actor update (per agent, since each has its own observation/action) -----
+        # ----- Actor update (per agent) -----
         actor_loss_total = 0
         for name in agent_names:
-            obs = torch.tensor(buffer.obs[name], dtype=torch.float32).unsqueeze(1)  # (batch, 1, 16)
+            obs = torch.tensor(buffer.obs[name], dtype=torch.float32)  # (batch, 16)
             old_log_probs = torch.tensor(buffer.log_probs[name], dtype=torch.float32)
             actions = torch.tensor(buffer.actions[name], dtype=torch.long)
             agent_advantages = torch.tensor(advantages[name], dtype=torch.float32)
-
-            # Normalize advantages (standard PPO trick -- stabilizes training)
             agent_advantages = (agent_advantages - agent_advantages.mean()) / (agent_advantages.std() + 1e-8)
 
-            logits, _ = actor(obs, actor_hidden)
-            logits = logits.squeeze(1)  # (batch, 4)
+            logits = _forward_actor_sequence(actor, obs, dones)  # (batch, 4)
             dist = torch.distributions.Categorical(logits=logits)
             new_log_probs = dist.log_prob(actions)
             entropy = dist.entropy().mean()
-
             ratio = torch.exp(new_log_probs - old_log_probs)
             surr1 = ratio * agent_advantages
             surr2 = torch.clamp(ratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * agent_advantages
             policy_loss = -torch.min(surr1, surr2).mean()
-
             actor_loss_total += policy_loss - ENTROPY_COEF * entropy
 
         actor_optimizer.zero_grad()

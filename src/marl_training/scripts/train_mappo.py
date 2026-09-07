@@ -69,6 +69,9 @@ def main():
     print("Initial reset...")
     obs = env.reset(max_goal_distance=get_curriculum_max_goal_distance(start_update + 1))
 
+    actor_hidden = {name: actor.init_hidden(1) for name in ['jb_0', 'jb_1']}
+    critic_hidden_rollout = critic.init_hidden(1)
+
     start_time = time.time()
 
     for update in range(start_update + 1, NUM_UPDATES + 1):
@@ -84,19 +87,18 @@ def main():
 
             actions = {}
             log_probs = {}
-            for name in ['jb_0', 'jb_1']:
-                obs_tensor = torch.tensor(obs[name], dtype=torch.float32).view(1, 1, 16)
-                hidden = actor.init_hidden(1)
-                logits, _ = actor(obs_tensor, hidden)
-                dist = torch.distributions.Categorical(logits=logits.squeeze())
-                action = dist.sample()
-                actions[name] = action.item()
-                log_probs[name] = dist.log_prob(action).item()
+            with torch.no_grad():
+                for name in ['jb_0', 'jb_1']:
+                    obs_tensor = torch.tensor(obs[name], dtype=torch.float32).view(1, 1, 16)
+                    logits, actor_hidden[name] = actor(obs_tensor, actor_hidden[name])
+                    dist = torch.distributions.Categorical(logits=logits.squeeze())
+                    action = dist.sample()
+                    actions[name] = action.item()
+                    log_probs[name] = dist.log_prob(action).item()
 
-            joint_obs_tensor = torch.tensor(joint_obs, dtype=torch.float32).view(1, 1, 32)
-            critic_hidden = critic.init_hidden(1)
-            values, _ = critic(joint_obs_tensor, critic_hidden)
-            values = values.squeeze().tolist()
+                joint_obs_tensor = torch.tensor(joint_obs, dtype=torch.float32).view(1, 1, 32)
+                values, critic_hidden_rollout = critic(joint_obs_tensor, critic_hidden_rollout)
+                values = values.squeeze().tolist()
 
             next_obs, rewards, dones = env.step(actions)   
 
@@ -117,6 +119,8 @@ def main():
                     episode_rewards[name].append(current_ep_reward[name])
                     current_ep_reward[name] = 0.0
                 obs = env.reset(max_goal_distance=get_curriculum_max_goal_distance(update))
+                actor_hidden = {name: actor.init_hidden(1) for name in ['jb_0', 'jb_1']}
+                critic_hidden_rollout = critic.init_hidden(1)
 
         # ----- Compute GAE per agent -----
         advantages = {}
