@@ -194,10 +194,8 @@ class MultiJetBotEnv:
                 reward = 10.0
                 done = True
             elif is_colliding_now:
-                if self.agent_colliding[name]:
-                    reward = -1.0
-                else:
-                    reward = -10.0
+                reward = -10.0
+                done = True
 
             self.agent_colliding[name] = is_colliding_now
 
