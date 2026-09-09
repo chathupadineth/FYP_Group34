@@ -14,7 +14,7 @@ def get_curriculum_max_goal_distance(update_num):
     return 1.0   # close goals for this entire 50-update test run
 
 ROLLOUT_LENGTH = 200      # steps collected per update (~1 episode's worth)
-NUM_UPDATES = 110         # short test run
+NUM_UPDATES = 100        # short test run
 CHECKPOINT_EVERY = 10
 LEARNING_RATE = 5e-4
 
