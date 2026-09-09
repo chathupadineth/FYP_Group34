@@ -1,0 +1,15 @@
+
+# Python compiled files
+__pycache__/
+*.pyc
+
+# Model weights - binary, change every update, bloat the repo
+checkpoints/
+checkpoints_*/
+
+# Collected datasets - large binary
+*.npz
+nav_dataset*
+
+# Backup copies (git history already keeps the originals)
+*_ORIGINAL_backup.py

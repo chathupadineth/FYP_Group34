@@ -14,7 +14,7 @@ def get_curriculum_max_goal_distance(update_num):
     return 1.0   # close goals for this entire 50-update test run
 
 ROLLOUT_LENGTH = 200      # steps collected per update (~1 episode's worth)
-NUM_UPDATES = 100          # short test run
+NUM_UPDATES = 110         # short test run
 CHECKPOINT_EVERY = 10
 LEARNING_RATE = 5e-4
 
@@ -64,7 +64,8 @@ def main():
     if not log_file_exists:
         log_writer.writerow(['update', 'avg_reward_jb0', 'avg_reward_jb1',
                               'episodes_completed', 'goals_reached', 'collisions',
-                              'critic_loss', 'actor_loss', 'elapsed_sec'])
+                              'critic_loss', 'actor_loss', 'elapsed_sec',
+                              'active_steps_jb0', 'active_steps_jb1'])
 
     print("Initial reset...")
     obs = env.reset(max_goal_distance=get_curriculum_max_goal_distance(start_update + 1))
@@ -81,9 +82,16 @@ def main():
         current_ep_reward = {'jb_0': 0.0, 'jb_1': 0.0}
         goals_reached = 0
         collisions = 0
+        action_counts = {'jb_0': [0, 0, 0, 0], 'jb_1': [0, 0, 0, 0]}
 
         for step in range(ROLLOUT_LENGTH):
             joint_obs = obs['jb_0'] + obs['jb_1']
+
+            # Which robots are actually still running THIS step? A robot that
+            # already reached its goal or crashed is stopped by the env, so its
+            # sampled action does nothing and its 0.0 reward says nothing about
+            # that action. Those steps get masked out of the loss later.
+            active = {name: not env.agent_done[name] for name in ['jb_0', 'jb_1']}
 
             actions = {}
             log_probs = {}
@@ -95,6 +103,7 @@ def main():
                     action = dist.sample()
                     actions[name] = action.item()
                     log_probs[name] = dist.log_prob(action).item()
+                    action_counts[name][action.item()] += 1
 
                 joint_obs_tensor = torch.tensor(joint_obs, dtype=torch.float32).view(1, 1, 32)
                 values, critic_hidden_rollout = critic(joint_obs_tensor, critic_hidden_rollout)
@@ -103,7 +112,8 @@ def main():
             next_obs, rewards, dones = env.step(actions)   
 
             episode_done = all(dones.values())
-            buffer.add(obs, joint_obs, actions, log_probs, rewards, values, episode_done)
+            buffer.add(obs, joint_obs, actions, log_probs, rewards, values, episode_done,
+                       active=active, agent_dones=dones)
 
             for name in ['jb_0', 'jb_1']:
                 current_ep_reward[name] += rewards[name]
@@ -127,7 +137,12 @@ def main():
         returns = {}
         for i, name in enumerate(['jb_0', 'jb_1']):
             agent_values = [v[i] for v in buffer.values]
-            adv, ret = compute_gae(buffer.rewards[name], agent_values, buffer.dones)
+            # Use THIS robot's own terminal flag, not the shared episode flag.
+            # Otherwise value bootstrapping runs past the point where the robot
+            # actually finished and keeps crediting it for the other robot's
+            # remaining steps.
+            adv, ret = compute_gae(buffer.rewards[name], agent_values,
+                                    buffer.agent_dones[name])
             advantages[name] = adv
             returns[name] = ret
 
@@ -145,9 +160,19 @@ def main():
               f"episodes={len(episode_rewards['jb_0'])} goals={goals_reached} collisions={collisions} | "
               f"critic_loss={critic_loss:.4f} actor_loss={actor_loss:.4f} | "
               f"elapsed={elapsed/60:.1f}min")
+        print(f"    action counts (fwd,left,right,back) — jb_0: {action_counts['jb_0']} | jb_1: {action_counts['jb_1']}")
+
+        # How much of this rollout was real experience vs padding after a robot
+        # had already finished. Low numbers here mean most of the buffer is
+        # useless for that robot.
+        act = buffer.active_counts()
+        n = len(buffer)
+        print(f"    active steps — jb_0: {act['jb_0']}/{n} ({100*act['jb_0']/max(1,n):.0f}%) | "
+              f"jb_1: {act['jb_1']}/{n} ({100*act['jb_1']/max(1,n):.0f}%)")
 
         log_writer.writerow([update, avg_r0, avg_r1, len(episode_rewards['jb_0']),
-                              goals_reached, collisions, critic_loss, actor_loss, elapsed])
+                              goals_reached, collisions, critic_loss, actor_loss, elapsed,
+                              act['jb_0'], act['jb_1']])
         log_file.flush()
         os.fsync(log_file.fileno())
         save_checkpoint(actor, critic, update, tag='latest')
@@ -155,7 +180,9 @@ def main():
             save_checkpoint(actor, critic, update, tag=f'update{update}')
 
     for name in ['jb_0', 'jb_1']:
-        env.agents[name].publish_action(3)  # 3 = stop
+        # publish_action(3) is BACKWARD, not stop -- it used to drive both
+        # robots backwards when training finished.
+        env.agents[name].publish_stop()
 
     log_file.close()
     env.close()
