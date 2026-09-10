@@ -59,8 +59,13 @@ from jetbot_env import (
     JetBotAgent,
     NUM_LIDAR_SECTORS,
     MAX_LIDAR_RANGE,
+    LIDAR_NORM,
     DISCRETE_ACTIONS,
     WORLD_NAME,
+    GOAL_DIST_NORM,
+    wall_clearance,
+    ROBOT_RADIUS,
+    CONTACT_DIST,
 )
 import scripted_nav_eval as snav
 
@@ -68,8 +73,13 @@ import scripted_nav_eval as snav
 # These MUST match jetbot_env.py, or the dataset will not be compatible with
 # what the RL environment produces during training.
 # ---------------------------------------------------------------------------
-LIDAR_NORM = MAX_LIDAR_RANGE      # jetbot_env divides by 12.0
-GOAL_DIST_NORM = 3.2              # jetbot_env uses min(dist / 3.2, 1.0)
+# LIDAR_NORM is IMPORTED from jetbot_env above -- do not redefine it here.
+# It used to be reassigned to MAX_LIDAR_RANGE on this line, which silently
+# overwrote the import and would have produced a dataset normalised by 12.0
+# while training normalised by 3.5.
+# GOAL_DIST_NORM is IMPORTED from jetbot_env, like LIDAR_NORM -- never redefine
+# it here, or the dataset and the environment will normalise goal distance
+# differently and the cloned policy will misread every distance.
 
 # One env step in jetbot_env = ACTION_REPEAT(3) LIDAR cycles at 5.5 Hz ~ 0.55 s.
 # We drive smoothly at 20 Hz but only RECORD at that slower rate, so the
@@ -98,7 +108,7 @@ def build_observation(scan, odom, world_pose, goal):
                  if not math.isinf(r) and not math.isnan(r)]
         min_r = min(chunk) if chunk else MAX_LIDAR_RANGE
         min_r = min(min_r, MAX_LIDAR_RANGE)
-        sectors.append(min_r / LIDAR_NORM)
+        sectors.append(min(min_r / LIDAR_NORM, 1.0))
 
     px, py, yaw = world_pose
     gx, gy = goal
@@ -143,6 +153,8 @@ def expert_action(linear, angular):
 # ---------------------------------------------------------------------------
 # Scenario sampling -- spread across the whole map, across many distances
 # ---------------------------------------------------------------------------
+# Kept only so an OLD nav_dataset.npz still loads in dataset_tools.py. New
+# episodes are labelled by curriculum_band() below, not from this list.
 DIFFICULTY_BANDS = [
     ('easy',   0.4, 1.0),
     ('medium', 1.0, 2.0),
@@ -177,10 +189,97 @@ def sample_scenario(min_d, max_d, tries=200):
     return None
 
 
+# ---------------------------------------------------------------------------
+# Curriculum over goal distance, ending in full-map corner crossings
+# ---------------------------------------------------------------------------
+# Early episodes use short goals (~1 m) and the reachable distance grows with
+# every accepted episode, up to the widest separation this map allows. The last
+# stretch is corner-to-corner: each robot crosses the entire floor on a diagonal
+# while the other crosses the opposite diagonal, so their routes intersect in
+# the middle. That gives long-range navigation AND a genuine crossing, without
+# forcing the head-on situations that this map is too narrow to solve.
+#
+# Measured on this map:
+#     corner anchors SW/SE/NW/NE are all free space
+#     corner-to-corner diagonal        3.82 m
+#     widest free-point separation     3.76 m
+GOAL_DIST_START = 1.0        # first episodes
+GOAL_DIST_MAX = 3.6          # just inside what the map allows
+CORNER_PHASE_FRACTION = 0.25 # last quarter of the run is corner crossings
+
+_CORNER_INSET = 0.21
+CORNERS = {
+    'SW': (snav.PLATFORM_X_MIN + _CORNER_INSET, snav.PLATFORM_Y_MIN + _CORNER_INSET),
+    'SE': (snav.PLATFORM_X_MAX - _CORNER_INSET, snav.PLATFORM_Y_MIN + _CORNER_INSET),
+    'NW': (snav.PLATFORM_X_MIN + _CORNER_INSET, snav.PLATFORM_Y_MAX - _CORNER_INSET),
+    'NE': (snav.PLATFORM_X_MAX - _CORNER_INSET, snav.PLATFORM_Y_MAX - _CORNER_INSET),
+}
+# The two diagonals. Robot 0 takes one, robot 1 takes the other, so the routes
+# cross near the middle of the map instead of meeting head-on.
+CORNER_PAIRS = [
+    (('SW', 'NE'), ('NW', 'SE')),
+    (('NE', 'SW'), ('SE', 'NW')),
+    (('NW', 'SE'), ('NE', 'SW')),
+    (('SE', 'NW'), ('SW', 'NE')),
+]
+
+
+def curriculum_band(k, n_total):
+    """(label, min_distance, max_distance) for the k-th ACCEPTED episode."""
+    frac = k / max(1, n_total)
+    if frac >= 1.0 - CORNER_PHASE_FRACTION:
+        return ('corner', GOAL_DIST_MAX, 99.0)
+    ramp = frac / max(1e-9, 1.0 - CORNER_PHASE_FRACTION)
+    hi = GOAL_DIST_START + ramp * (GOAL_DIST_MAX - GOAL_DIST_START)
+    lo = max(0.4, 0.55 * hi)
+    if hi <= 1.2:
+        label = 'short'
+    elif hi <= 2.2:
+        label = 'medium'
+    elif hi <= 3.0:
+        label = 'long'
+    else:
+        label = 'very_long'
+    return (label, lo, hi)
+
+
+def _routed(start, goal):
+    try:
+        return start, goal, snav.plan_path(start, goal)
+    except RuntimeError:
+        return None
+
+
+def _near_corner(name, radius=0.30):
+    cx, cy = CORNERS[name]
+    for _ in range(300):
+        x = cx + random.uniform(-radius, radius)
+        y = cy + random.uniform(-radius, radius)
+        if snav.is_free(x, y):
+            return (x, y)
+    return (cx, cy) if snav.is_free(cx, cy) else None
+
+
+def sample_corner_scenarios():
+    """Both robots cross the whole map, on opposite diagonals."""
+    (a0, b0), (a1, b1) = random.choice(CORNER_PAIRS)
+    for _ in range(40):
+        s0, g0 = _near_corner(a0), _near_corner(b0)
+        s1, g1 = _near_corner(a1), _near_corner(b1)
+        if None in (s0, g0, s1, g1):
+            continue
+        r0, r1 = _routed(s0, g0), _routed(s1, g1)
+        if r0 and r1:
+            return {'jb_0': r0, 'jb_1': r1}
+    return None
+
+
 def sample_two_scenarios(band, min_separation=0.5):
-    """One scenario per robot, with starts far enough apart to spawn safely."""
-    _, lo, hi = band
-    for _ in range(60):
+    """One scenario per robot, drawn from the current curriculum band."""
+    label, lo, hi = band
+    if label == 'corner':
+        return sample_corner_scenarios()
+    for _ in range(80):
         s0 = sample_scenario(lo, hi)
         s1 = sample_scenario(lo, hi)
         if s0 is None or s1 is None:
@@ -189,6 +288,45 @@ def sample_two_scenarios(band, min_separation=0.5):
             continue
         return {'jb_0': s0, 'jb_1': s1}
     return None
+
+
+
+# ---------------------------------------------------------------------------
+# Goal markers -- purely so a human watching the simulator can see where each
+# robot is actually heading this episode
+# ---------------------------------------------------------------------------
+# The discs are <visual> only, with no <collision> element, so the LIDAR --
+# which raycasts collision geometry -- cannot see them and they cannot leak
+# into the dataset. Without this the only markers on screen are whatever
+# run_demo.sh left behind, which sit at the demo's goals and never move, so
+# every episode looks like the robots are ignoring them.
+_markers_spawned = False
+
+
+def place_goal_markers(goals):
+    """Put the two discs on this episode's goals.
+
+    Tries to create them on the first call, but run_demo.sh may already have
+    spawned markers under the same names -- in which case the create simply
+    fails and the move below adopts the existing ones, which is what we want.
+    Either way this is cosmetic: if it does not work the data is unaffected.
+    """
+    global _markers_spawned
+    if not _markers_spawned:
+        for n in AGENTS:
+            try:
+                snav.spawn_goal_marker(f'goal_{n}', goals[n][0], goals[n][1],
+                                        snav.GOAL_MARKER_COLOR[n])
+            except Exception:
+                pass
+        _markers_spawned = True
+    for n in AGENTS:
+        # Moving beats delete-and-respawn: one service call instead of two,
+        # and no window where the marker is missing.
+        try:
+            snav.teleport(f'goal_{n}', goals[n][0], goals[n][1], z=snav.MARKER_Z)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +340,8 @@ def run_episode(node, agents, gt, scenarios, episode_id, random_yaw_prob):
     # Face the first waypoint, or sometimes a random direction so the dataset
     # also contains "the goal is behind me" states -- otherwise the policy
     # never learns to turn around.
+    place_goal_markers(goals)
+
     yaws = {}
     for n in AGENTS:
         if random.random() < random_yaw_prob:
@@ -216,17 +356,26 @@ def run_episode(node, agents, gt, scenarios, episode_id, random_yaw_prob):
     snav.spin_for(node, 0.4)
 
     wp_idx = {n: 0 for n in AGENTS}
-    cmd = {n: [0.0, 0.0] for n in AGENTS}
     done = {n: False for n in AGENTS}
     samples = []
     step_in_ep = {n: 0 for n in AGENTS}
+    # Contacts are checked on EVERY control tick, not only on recording ticks,
+    # so a brief scrape between two samples cannot slip through unnoticed.
+    contacts = {n: 0 for n in AGENTS}
+    min_clearance = {n: float('inf') for n in AGENTS}
+    touching = {n: False for n in AGENTS}
 
     t0 = time.time()
     tick = 0
     while time.time() - t0 < MAX_EPISODE_SECONDS and not all(done.values()):
         snav.spin_for(node, snav.CONTROL_DT)
         tick += 1
-        record = (tick % TICKS_PER_SAMPLE == 0)
+        # Record on tick 1, not tick TICKS_PER_SAMPLE. Sampling only from tick
+        # 11 onwards meant the robot had already spent 0.55 s turning toward
+        # its goal before anything was written down, so the dataset never
+        # contained a "the goal is behind me" state -- which is exactly the
+        # state the policy most needs to learn to turn around from.
+        record = ((tick - 1) % TICKS_PER_SAMPLE == 0)
 
         poses = {}
         for n in AGENTS:
@@ -250,6 +399,52 @@ def run_episode(node, agents, gt, scenarios, episode_id, random_yaw_prob):
                 done[name] = True
                 continue
 
+            # --- contact check (same geometry jetbot_env uses) --------------
+            # Every tick, not just on decision ticks, so a brief scrape
+            # between two decisions cannot slip through unnoticed. Does not
+            # depend on which action is active, so it stays outside the
+            # `record` gate below.
+            clear = wall_clearance(px, py)
+            other_pose = poses['jb_1' if name == 'jb_0' else 'jb_0']
+            if other_pose is not None:
+                gap_c = math.hypot(other_pose[0] - px, other_pose[1] - py)
+                clear = min(clear, gap_c - ROBOT_RADIUS)
+            min_clearance[name] = min(min_clearance[name], clear)
+            if clear <= CONTACT_DIST:
+                if not touching[name]:
+                    contacts[name] += 1
+                touching[name] = True
+            else:
+                touching[name] = False
+
+            if not record:
+                # Between decisions the robot keeps running the Twist already
+                # published below -- exactly what jetbot_env.py does for its
+                # ACTION_REPEAT window (it does not re-publish every tick
+                # either). Nothing new to decide or send yet.
+                continue
+
+            # ------------------------------------------------------------
+            # THE FIX -- see decisions-and-learnings.md / gating/README.md
+            # history. The old code below this point computed a smooth,
+            # continuously rate-limited command (turn rate up to
+            # snav.MAX_ANG = 1.0 rad/s) and only discretised it into one of
+            # jetbot_env.DISCRETE_ACTIONS AFTER driving it, purely to pick a
+            # label. But DISCRETE_ACTIONS caps the agent's own turn rate at
+            # 0.6 rad/s -- the expert was demonstrating turns the deployed
+            # agent physically cannot perform. BC then cloned those
+            # observations perfectly (94.9% val accuracy) and, once
+            # deployed, applied its learned "turn right" at 0.6 instead of
+            # the 1.0 it was trained against, read the result as "still not
+            # turned enough", and repeated forever -- the spin-in-place loop
+            # both train_mappo.py and evaluate_policy.py hit. Confirmed from
+            # the dataset: expert vz spanned +-1.0, the agent's is +-0.6.
+            #
+            # The fix: decide a DISCRETE action here, before touching the
+            # motors, and publish its EXACT (lin, ang) unmodified -- no
+            # rate limiting. The dataset can then never contain a state
+            # reached by motion the agent cannot reproduce.
+            # ------------------------------------------------------------
             path = paths[name]
             target = path[wp_idx[name]]
             ang_err, dist_wp = snav.angle_and_dist_to(px, py, yaw, target)
@@ -276,34 +471,35 @@ def run_episode(node, agents, gt, scenarios, episode_id, random_yaw_prob):
                         (gap - snav.AGENT_EMERGENCY_RADIUS) / span)
                     lin_t *= max(snav.YIELD_MIN_SPEED_FRACTION, min(1.0, slow))
 
-            lin = snav.rate_limit(cmd[name][0], lin_t, snav.ACCEL_LIN * snav.CONTROL_DT)
-            ang = snav.rate_limit(cmd[name][1], ang_t, snav.ACCEL_ANG * snav.CONTROL_DT)
-            cmd[name] = [lin, ang]
+            # Snap the CONTINUOUS intent (lin_t, ang_t) to the nearest of the
+            # 4 real actions, then execute THAT action's exact values. This
+            # is the command now, not a label computed after the fact.
+            action_id = expert_action(lin_t, ang_t)
+            lin, ang = DISCRETE_ACTIONS[action_id]
 
             twist = Twist()
             twist.linear.x = lin
             twist.angular.z = ang
             agent.cmd_pub.publish(twist)
 
-            if record:
-                obs, d = build_observation(agent.latest_scan, agent.latest_odom,
-                                            poses[name], goals[name])
-                samples.append({
-                    'obs': obs,
-                    'action': expert_action(lin, ang),
-                    'x': px, 'y': py, 'yaw': yaw,
-                    'gx': goals[name][0], 'gy': goals[name][1],
-                    'dist': d,
-                    'agent': 0 if name == 'jb_0' else 1,
-                    'episode': episode_id,
-                    'step': step_in_ep[name],
-                })
-                step_in_ep[name] += 1
+            obs, d = build_observation(agent.latest_scan, agent.latest_odom,
+                                        poses[name], goals[name])
+            samples.append({
+                'obs': obs,
+                'action': action_id,
+                'x': px, 'y': py, 'yaw': yaw,
+                'gx': goals[name][0], 'gy': goals[name][1],
+                'dist': d,
+                'agent': 0 if name == 'jb_0' else 1,
+                'episode': episode_id,
+                'step': step_in_ep[name],
+            })
+            step_in_ep[name] += 1
 
     for agent in agents.values():
         agent.publish_stop()
 
-    return samples, done, starts, goals
+    return samples, done, starts, goals, contacts, min_clearance
 
 
 # ---------------------------------------------------------------------------
@@ -334,16 +530,20 @@ def save(out_path, samples, episodes):
         ep_success=np.asarray([e['success'] for e in episodes], dtype=np.int8),
         ep_distance=np.asarray([e['distance'] for e in episodes], dtype=np.float32),
         ep_band=np.asarray([e['band'] for e in episodes]),
+        ep_contacts=np.asarray([e.get('contacts', 0) for e in episodes], dtype=np.int16),
+        ep_min_clearance=np.asarray([e.get('min_clearance', 0.0) for e in episodes], dtype=np.float32),
     )
     csv_path = out_path.replace('.npz', '_episodes.csv')
     with open(csv_path, 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['agent', 'start_x', 'start_y', 'goal_x', 'goal_y',
-                    'distance', 'band', 'success'])
+                    'distance', 'band', 'contacts', 'min_clearance', 'success'])
         for e in episodes:
             w.writerow([e['agent'], round(e['start'][0], 3), round(e['start'][1], 3),
                         round(e['goal'][0], 3), round(e['goal'][1], 3),
-                        round(e['distance'], 3), e['band'], e['success']])
+                        round(e['distance'], 3), e['band'],
+                        e.get('contacts', 0),
+                        round(e.get('min_clearance', 0.0), 3), e['success']])
     print(f"  saved {len(samples)} samples / {len(episodes)} robot-runs -> {out_path}")
 
 
@@ -363,6 +563,7 @@ def load_existing(out_path):
         'goal': (float(d['ep_goal_x'][i]), float(d['ep_goal_y'][i])),
         'agent': int(d['ep_agent'][i]), 'success': int(d['ep_success'][i]),
         'distance': float(d['ep_distance'][i]), 'band': str(d['ep_band'][i]),
+        'contacts': int(d['ep_contacts'][i]) if 'ep_contacts' in d else 0,
     } for i in range(len(d['ep_start_x']))]
     return samples, episodes
 
@@ -376,12 +577,16 @@ def main():
     ap.add_argument('--append', action='store_true',
                     help='add to an existing dataset instead of overwriting')
     ap.add_argument('--save-every', type=int, default=5)
-    ap.add_argument('--random-yaw-prob', type=float, default=0.3,
+    ap.add_argument('--random-yaw-prob', type=float, default=0.5,
                     help='fraction of spawns facing a random direction')
     ap.add_argument('--seed', type=int, default=None)
+    ap.add_argument('--max-attempt-factor', type=float, default=3.0,
+                    help='give up after episodes x this many attempts '
+                         '(rejected runs still cost time)')
     ap.add_argument('--dry-run', action='store_true',
                     help='run a few episodes without writing the dataset')
     args = ap.parse_args()
+
 
     if args.seed is not None:
         random.seed(args.seed)
@@ -414,41 +619,91 @@ def main():
     print("Ground truth OK. Position values will be correct.\n")
 
     est = args.episodes * MAX_EPISODE_SECONDS / 60.0
-    print(f"Collecting {args.episodes} episodes. Worst case ~{est:.0f} min "
-          f"(usually much less -- episodes end early on success).\n")
+    print(f"Target: {args.episodes} ACCEPTED episodes "
+          f"(both robots reach their goal, neither touches anything).")
+    print(f"Goal distance ramps {GOAL_DIST_START:.1f} m -> {GOAL_DIST_MAX:.1f} m, "
+          f"then the last {100*CORNER_PHASE_FRACTION:.0f}% are corner-to-corner "
+          f"crossings.")
+    print(f"Rejected episodes are DISCARDED, so the dataset contains only clean "
+          f"runs.\n")
+
+    accepted = 0
+    attempts = 0
+    rejected = {'not_reached': 0, 'contact': 0, 'no_scenario': 0}
+    max_attempts = args.episodes * args.max_attempt_factor
 
     try:
-        for ep in range(args.episodes):
-            band = DIFFICULTY_BANDS[ep % len(DIFFICULTY_BANDS)]
+        while accepted < args.episodes and attempts < max_attempts:
+            attempts += 1
+            band = curriculum_band(accepted, args.episodes)
             scen = sample_two_scenarios(band)
             if scen is None:
-                print(f"[{ep+1}/{args.episodes}] could not sample a '{band[0]}' pair, skipping")
+                rejected['no_scenario'] += 1
+                print(f"[{accepted}/{args.episodes}] band={band[0]:<10} "
+                      f"REJECT  no route found")
                 continue
 
-            new, done, starts, goals = run_episode(
-                node, agents, gt, scen, ep_offset + ep, args.random_yaw_prob)
-            samples.extend(new)
+            new, done, starts, goals, contacts, min_clear = run_episode(
+                node, agents, gt, scen, ep_offset + accepted, args.random_yaw_prob)
 
+            both_reached = all(done[n] for n in AGENTS)
+            total_contacts = sum(contacts[n] for n in AGENTS)
+            worst = min(min_clear[n] for n in AGENTS)
+
+            if not both_reached or total_contacts > 0:
+                # Throw the whole episode away -- including the robot that DID
+                # succeed. A trajectory recorded next to a robot that crashed is
+                # still a trajectory the policy should not copy.
+                reason = 'contact' if total_contacts else 'not_reached'
+                rejected[reason] += 1
+                detail = (f"{total_contacts} contact(s), worst clearance {worst:.3f}m"
+                          if total_contacts
+                          else f"reached {sum(done[n] for n in AGENTS)}/2")
+                print(f"[{accepted}/{args.episodes}] band={band[0]:<10} "
+                      f"REJECT  {detail}")
+                continue
+
+            samples.extend(new)
             for i, n in enumerate(AGENTS):
                 episodes.append({
                     'start': starts[n], 'goal': goals[n], 'agent': i,
-                    'success': int(done[n]), 'band': band[0],
+                    'success': 1, 'band': band[0],
+                    'contacts': 0,
+                    'min_clearance': float(min_clear[n]),
                     'distance': math.hypot(goals[n][0] - starts[n][0],
                                             goals[n][1] - starts[n][1]),
                 })
+            accepted += 1
+            d0 = math.hypot(goals['jb_0'][0] - starts['jb_0'][0],
+                            goals['jb_0'][1] - starts['jb_0'][1])
+            d1 = math.hypot(goals['jb_1'][0] - starts['jb_1'][0],
+                            goals['jb_1'][1] - starts['jb_1'][1])
+            print(f"[{accepted}/{args.episodes}] band={band[0]:<10} ACCEPT  "
+                  f"dist {d0:.2f}/{d1:.2f}m  clearance {worst:.3f}m  "
+                  f"samples+={len(new):<4} total={len(samples)}")
 
-            ok = sum(1 for n in AGENTS if done[n])
-            print(f"[{ep+1}/{args.episodes}] band={band[0]:<9} "
-                  f"samples+={len(new):<4} reached={ok}/2  total={len(samples)}")
-
-            if not args.dry_run and (ep + 1) % args.save_every == 0:
+            if not args.dry_run and accepted % args.save_every == 0:
                 save(args.out, samples, episodes)
+
+        if accepted < args.episodes:
+            print(f"\nStopped after {attempts} attempts with {accepted} accepted. "
+                  f"Raise --max-attempt-factor if you want more.")
 
     except KeyboardInterrupt:
         print("\nStopped by user.")
     finally:
+        # rclpy may already be torn down after Ctrl+C, in which case publishing
+        # raises RCLError and hides whatever actually happened. Saving the data
+        # matters more than the stop command.
         for agent in agents.values():
-            agent.publish_stop()
+            try:
+                agent.publish_stop()
+            except Exception:
+                pass
+        print(f"\nAccepted {accepted} / attempted {attempts}")
+        print(f"  rejected -- did not reach goal : {rejected['not_reached']}")
+        print(f"  rejected -- made contact       : {rejected['contact']}")
+        print(f"  rejected -- no route sampled   : {rejected['no_scenario']}")
         if not args.dry_run:
             save(args.out, samples, episodes)
         gt.stop()

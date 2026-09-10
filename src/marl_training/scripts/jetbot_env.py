@@ -17,9 +17,54 @@ from spawn_utils import (
 from pose_source import PoseSource
 
 NUM_LIDAR_SECTORS = 12
-MAX_LIDAR_RANGE = 12.0
-MAX_EPISODE_STEPS = 200
+MAX_LIDAR_RANGE = 12.0     # the sensor's own maximum -- clamp and "nothing in range" fallback
+
+# What LIDAR readings are DIVIDED BY before they reach the network.
+# This is deliberately NOT the sensor maximum. The room is only ~3 x 3.25 m, so
+# dividing by 12.0 squashed every reading into 0.02-0.24 (std 0.035) while the
+# goal-angle input spans -1..+1 (std ~0.5). The obstacle inputs were ~15x
+# quieter than the goal inputs, so the policy learned to ignore walls entirely:
+# 0% timeouts and 0.95x-optimal routes, but a 30% collision rate.
+# 3.5 was the first fix, chosen from ray-casts taken at RANDOM points on the
+# map. Real collected data then showed the robot never sees that far: following
+# A* routes at 0.16 m clearance it hugs obstacles, and 10 of the 12 sectors
+# never exceeded 1.27 m over a whole dataset. Measured on nav_dataset.npz:
+#
+#     LIDAR_NORM     mean      max     clipped
+#        12.0       0.034    0.106       0%     original, hopeless
+#         3.5       0.117    0.363       0%     first fix, still only 36% of range
+#         2.0       0.205    0.635       0%     <- here
+#
+# 2.0 nearly doubles the spread and still clips nothing, because the longest
+# reading actually observed (1.27 m) maps to 0.635. Anything beyond 2 m in a
+# 3 m room is "far" as far as obstacle avoidance is concerned.
+# Set this back to MAX_LIDAR_RANGE to evaluate a pre-fix checkpoint.
+LIDAR_NORM = 2.0
+
+# Episodes used to run 200 steps, but with collisions no longer terminal a
+# robot survives to the cap almost every time, so a 200-step rollout became
+# ONE episode -- and any robot that reached its goal early spent the rest of
+# it as masked-out padding. 100 steps is still ~5x what a <=1 m goal needs
+# (~20 steps at 0.083 m/step) and gives roughly twice the episodes, i.e. twice
+# the fresh starts and twice the chances to see a goal.
+MAX_EPISODE_STEPS = 100
 GOAL_REACHED_DIST = 0.15
+
+# Touching a wall no longer ends the episode. The old terminal -10.0 made
+# contact a cliff: 91% of robot-runs died on it, so the policy saw a +10 goal
+# only once every ~526 steps and learned to freeze or turn away rather than
+# navigate. Now the robot is charged once per contact and carries on, so a
+# single episode can contain a mistake, a recovery, and a success -- which is
+# exactly the sequence it has to learn.
+COLLISION_PENALTY = -2.0
+
+# What distance-to-goal is divided by before it reaches the network.
+# It was 3.2, but the widest goal this map allows is 3.82 m, so every long
+# scenario -- the whole corner-to-corner phase of the dataset -- clipped to
+# exactly 1.0 and the network could not tell 3.2 m from 3.8 m. 4.0 covers the
+# map with a little headroom.
+# collect_dataset.py imports this, so the two can never drift apart.
+GOAL_DIST_NORM = 4.0
 COLLISION_DIST = 0.20      # legacy LIDAR threshold -- no longer used for collisions
 
 # ---------------------------------------------------------------------------
@@ -123,6 +168,7 @@ class MultiJetBotEnv:
         self.agent_done = {'jb_0': False, 'jb_1': False}
         self.agent_colliding = {'jb_0': False, 'jb_1': False}
         self.prev_distance = {'jb_0': None, 'jb_1': None}
+        self.collision_events = {'jb_0': 0, 'jb_1': 0}
 
     def _spin_until_fresh(self, timeout_sec=2.0):
         start = time.time()
@@ -159,6 +205,10 @@ class MultiJetBotEnv:
         self.agent_done = {'jb_0': False, 'jb_1': False}
         self.agent_colliding = {'jb_0': False, 'jb_1': False}
         self.prev_distance = {'jb_0': None, 'jb_1': None}
+        # Collisions are no longer terminal, so they can't be counted from the
+        # reward any more (there is no unique -10.0 to look for). Callers read
+        # this instead: how many times each robot has made contact this episode.
+        self.collision_events = {'jb_0': 0, 'jb_1': 0}
         pos0, pos1, goal0, goal1 = sample_two_agents_and_goals(max_goal_distance=max_goal_distance)
         
         self._teleport('jb_0', pos0[0], pos0[1])
@@ -198,7 +248,7 @@ class MultiJetBotEnv:
             chunk = [r for r in chunk if not math.isinf(r) and not math.isnan(r)]
             min_r = min(chunk) if chunk else MAX_LIDAR_RANGE
             min_r = min(min_r, MAX_LIDAR_RANGE)
-            sectors.append(min_r / MAX_LIDAR_RANGE)
+            sectors.append(min(min_r / LIDAR_NORM, 1.0))
 
             sector_center = angle_min + (i * sector_size + sector_size / 2.0) * angle_increment
             sector_center = math.atan2(math.sin(sector_center), math.cos(sector_center))
@@ -241,12 +291,16 @@ class MultiJetBotEnv:
             centre_gap = math.hypot(op[0] - px, op[1] - py)
             clearance = min(clearance, centre_gap - ROBOT_RADIUS)
 
-        if clearance <= CONTACT_DIST:
+        # Only announce a collision for a robot that is still running. Once it
+        # is done it stays parked against whatever it hit, so this would
+        # otherwise reprint the same line every step for the rest of the
+        # episode and bury the real output.
+        if clearance <= CONTACT_DIST and not self.agent_done[name]:
             print(f"[{name}] COLLISION — clearance={clearance:.3f}m "
                   f"(contact at {ROBOT_RADIUS:.3f}m)")
 
         obs = sectors + [
-            min(dist / 3.2, 1.0),
+            min(dist / GOAL_DIST_NORM, 1.0),
             angle_to_goal / math.pi,
             vx,
             vz,
@@ -287,13 +341,19 @@ class MultiJetBotEnv:
             reward = shaping_reward - 0.01
             done = False
             is_colliding_now = clearance <= CONTACT_DIST
+            was_colliding = self.agent_colliding[name]
 
             if dist <= GOAL_REACHED_DIST:
                 reward = 10.0
                 done = True
-            elif is_colliding_now:
-                reward = -10.0
-                done = True
+            elif is_colliding_now and not was_colliding:
+                # Charged ONCE, on the step the robot makes contact -- not for
+                # every step it stays touching. Charging per step would make a
+                # robot pinned against a wall accumulate a penalty far worse
+                # than the old terminal -10.0, which is the opposite of the
+                # intent.
+                reward = shaping_reward - 0.01 + COLLISION_PENALTY
+                self.collision_events[name] += 1
 
             self.agent_colliding[name] = is_colliding_now
 

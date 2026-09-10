@@ -1,8 +1,6 @@
 import os
 import csv
 import time
-from collections import deque
-
 import torch
 import torch.optim as optim
 
@@ -12,72 +10,18 @@ from buffer import RolloutBuffer
 from gae import compute_gae
 from ppo_update import ppo_update
 
-# ---------------------------------------------------------------------------
-# CURRICULUM
-# ---------------------------------------------------------------------------
-# How far a goal may be from its robot. It used to be pinned at 1.0 for a short
-# test run and never moved.
-#
-# The rungs are chosen from how often a STRAIGHT LINE from start to goal is
-# collision-free on this map -- i.e. the best a policy can do while ignoring
-# its LIDAR entirely:
-#
-#     max dist    mean dist    straight line clear
-#       1.0 m       0.76 m           71%
-#       1.5 m       1.06 m           49%     <- obstacle avoidance becomes
-#       2.0 m       1.31 m           40%        mandatory from here on
-#       2.5 m       1.58 m           31%
-#       3.0 m       1.87 m           24%
-#       none        1.97 m           21%
-#
-# A policy that only learned "turn to the goal and drive" tops out at those
-# numbers, so each rung forces it to actually use the range sensor.
-CURRICULUM = [1.0, 1.5, 2.0, 2.5, 3.0, None]     # None = no limit
-
-# Promotion is driven by RESULTS, not by update number. Advancing on a fixed
-# schedule is how a curriculum kills a run: if the policy is still weak at 1.0
-# when update 150 arrives, moving it to 1.5 leaves it failing at both.
-PROMOTE_SR = 0.55           # rolling success rate needed to move up a rung
-PROMOTE_WINDOW = 10         # updates in the rolling window
-PROMOTE_MIN_UPDATES = 15    # minimum time on a rung before promotion
+def get_curriculum_max_goal_distance(update_num):
+    return 1.0   # close goals for this entire 50-update test run
 
 ROLLOUT_LENGTH = 200      # steps collected per update (~1 episode's worth)
-NUM_UPDATES = 300
+NUM_UPDATES = 100        # short test run
 CHECKPOINT_EVERY = 10
 LEARNING_RATE = 5e-4
-
-# Critic-only updates before the actor is touched. See the call to ppo_update.
-CRITIC_WARMUP_UPDATES = 10
 
 CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), 'checkpoints')
 LOG_PATH = os.path.join(os.path.dirname(__file__), 'training_log.csv')
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-
-
-STAGE_PATH = os.path.join(CHECKPOINT_DIR, 'curriculum_stage.txt')
-
-
-def save_stage(stage, update_num):
-    """The curriculum rung must survive a restart. Without this, resuming would
-    silently drop the policy back to 1.0 m goals and undo the progress that
-    earned the promotion."""
-    with open(STAGE_PATH, 'w') as f:
-        f.write(f"{stage}\n{update_num}\n")
-
-
-def load_stage():
-    try:
-        with open(STAGE_PATH) as f:
-            stage = int(f.readline().strip())
-        return max(0, min(stage, len(CURRICULUM) - 1))
-    except (OSError, ValueError):
-        return 0
-
-
-def stage_label(stage):
-    d = CURRICULUM[stage]
-    return 'unrestricted' if d is None else f'{d:.1f} m'
 
 
 def save_checkpoint(actor, critic, update_num, tag='latest'):
@@ -121,19 +65,10 @@ def main():
         log_writer.writerow(['update', 'avg_reward_jb0', 'avg_reward_jb1',
                               'episodes_completed', 'goals_reached', 'collisions',
                               'critic_loss', 'actor_loss', 'elapsed_sec',
-                              'active_steps_jb0', 'active_steps_jb1',
-                              'max_goal_distance', 'rolling_success_rate'])
-
-    stage = load_stage()
-    updates_on_stage = 0
-    # Success rate is per ROBOT-RUN, not per update. Every episode ends both
-    # robots, so runs = 2 x episodes. Counting per update instead makes a rung
-    # look easier simply because its episodes got longer.
-    window = deque(maxlen=PROMOTE_WINDOW)      # (goals, runs) per update
-    print(f"Curriculum stage {stage}/{len(CURRICULUM)-1}: goals within {stage_label(stage)}")
+                              'active_steps_jb0', 'active_steps_jb1'])
 
     print("Initial reset...")
-    obs = env.reset(max_goal_distance=CURRICULUM[stage])
+    obs = env.reset(max_goal_distance=get_curriculum_max_goal_distance(start_update + 1))
 
     actor_hidden = {name: actor.init_hidden(1) for name in ['jb_0', 'jb_1']}
     critic_hidden_rollout = critic.init_hidden(1)
@@ -147,7 +82,6 @@ def main():
         current_ep_reward = {'jb_0': 0.0, 'jb_1': 0.0}
         goals_reached = 0
         collisions = 0
-        prev_collision_events = dict(env.collision_events)
         action_counts = {'jb_0': [0, 0, 0, 0], 'jb_1': [0, 0, 0, 0]}
 
         for step in range(ROLLOUT_LENGTH):
@@ -185,18 +119,8 @@ def main():
                 current_ep_reward[name] += rewards[name]
                 if rewards[name] >= 10.0:
                     goals_reached += 1
-
-            # Collisions are no longer terminal and no longer produce a unique
-            # -10.0, so they are read from the environment's own counter. Taken
-            # as a delta because the counter resets with the episode, not with
-            # the rollout.
-            for name in ['jb_0', 'jb_1']:
-                ev = env.collision_events[name]
-                if ev >= prev_collision_events[name]:
-                    collisions += ev - prev_collision_events[name]
-                else:
-                    collisions += ev          # env.reset() zeroed the counter
-                prev_collision_events[name] = ev
+                elif rewards[name] <= -10.0:
+                    collisions += 1
 
             obs = next_obs
 
@@ -204,10 +128,7 @@ def main():
                 for name in ['jb_0', 'jb_1']:
                     episode_rewards[name].append(current_ep_reward[name])
                     current_ep_reward[name] = 0.0
-                obs = env.reset(max_goal_distance=CURRICULUM[stage])
-                # reset() zeroed the counter; re-baseline so the next delta is
-                # measured from 0 rather than from the finished episode's total.
-                prev_collision_events = {'jb_0': 0, 'jb_1': 0}
+                obs = env.reset(max_goal_distance=get_curriculum_max_goal_distance(update))
                 actor_hidden = {name: actor.init_hidden(1) for name in ['jb_0', 'jb_1']}
                 critic_hidden_rollout = critic.init_hidden(1)
 
@@ -225,24 +146,14 @@ def main():
             advantages[name] = adv
             returns[name] = ret
 
-        # A behaviour-cloned actor arrives with a random critic. Applying PPO
-        # immediately would compute advantages from a meaningless value
-        # function and undo the cloning in a handful of updates, so the critic
-        # is given a head start on its own. Starting from scratch (no BC), the
-        # actor is random anyway and the warmup costs nothing.
-        warming_up = update <= start_update + CRITIC_WARMUP_UPDATES
         critic_loss, actor_loss = ppo_update(
             actor, critic, actor_optimizer, critic_optimizer,
-            buffer, advantages, returns, update_actor=not warming_up
+            buffer, advantages, returns
         )
 
         avg_r0 = sum(episode_rewards['jb_0']) / len(episode_rewards['jb_0']) if episode_rewards['jb_0'] else 0.0
         avg_r1 = sum(episode_rewards['jb_1']) / len(episode_rewards['jb_1']) if episode_rewards['jb_1'] else 0.0
         elapsed = time.time() - start_time
-
-        if warming_up:
-            print(f"    [critic warmup {update - start_update}/{CRITIC_WARMUP_UPDATES}"
-                  f" — actor frozen]")
 
         print(f"[Update {update}/{NUM_UPDATES}] "
               f"avg_reward jb_0={avg_r0:.2f} jb_1={avg_r1:.2f} | "
@@ -259,35 +170,9 @@ def main():
         print(f"    active steps — jb_0: {act['jb_0']}/{n} ({100*act['jb_0']/max(1,n):.0f}%) | "
               f"jb_1: {act['jb_1']}/{n} ({100*act['jb_1']/max(1,n):.0f}%)")
 
-        # ----- Curriculum: promote on results, never on a fixed schedule -----
-        episodes = len(episode_rewards['jb_0'])
-        window.append((goals_reached, 2 * episodes))
-        win_goals = sum(g for g, _ in window)
-        win_runs = sum(r for _, r in window)
-        rolling_sr = win_goals / win_runs if win_runs else 0.0
-        updates_on_stage += 1
-
-        print(f"    curriculum — goals within {stage_label(stage)} | "
-              f"rolling SR (last {len(window)} updates) = {100*rolling_sr:.1f}% "
-              f"({win_goals}/{win_runs} runs) | {updates_on_stage} updates on this rung")
-
-        if (stage < len(CURRICULUM) - 1
-                and updates_on_stage >= PROMOTE_MIN_UPDATES
-                and len(window) == PROMOTE_WINDOW
-                and rolling_sr >= PROMOTE_SR):
-            stage += 1
-            updates_on_stage = 0
-            window.clear()          # the old rung's scores say nothing about the new one
-            print(f"    *** PROMOTED to stage {stage}: goals within {stage_label(stage)} ***")
-            print(f"    Expect success rate to DROP now. That is the curriculum working,")
-            print(f"    not the policy breaking.")
-        save_stage(stage, update)
-
-        log_writer.writerow([update, avg_r0, avg_r1, episodes,
+        log_writer.writerow([update, avg_r0, avg_r1, len(episode_rewards['jb_0']),
                               goals_reached, collisions, critic_loss, actor_loss, elapsed,
-                              act['jb_0'], act['jb_1'],
-                              '' if CURRICULUM[stage] is None else CURRICULUM[stage],
-                              round(rolling_sr, 4)])
+                              act['jb_0'], act['jb_1']])
         log_file.flush()
         os.fsync(log_file.fileno())
         save_checkpoint(actor, critic, update, tag='latest')

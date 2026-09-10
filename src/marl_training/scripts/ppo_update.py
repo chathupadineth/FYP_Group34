@@ -65,9 +65,16 @@ def _masked_normalise(x, mask):
 
 
 def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer,
-               advantages, returns, agent_names=('jb_0', 'jb_1')):
+               advantages, returns, agent_names=('jb_0', 'jb_1'),
+               update_actor=True):
     """
     advantages, returns: dicts keyed by agent name, each a list matching buffer length
+
+    update_actor=False trains the critic only. This matters when the actor was
+    initialised by behavioural cloning: the critic starts random, so its early
+    advantages are noise, and applying them would overwrite the cloned policy
+    within a few updates. Letting the value function catch up first keeps the
+    head start that cloning bought.
     """
     joint_obs = torch.tensor(buffer.joint_obs, dtype=torch.float32)  # (batch, 32)
     dones = buffer.dones  # episode boundaries -> where the GRU state resets
@@ -91,6 +98,9 @@ def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer,
         critic_optimizer.step()
 
         # ----- Actor update (per agent) -----
+        if not update_actor:
+            actor_loss_total = torch.zeros(1)
+            continue
         actor_loss_total = 0
         for name in agent_names:
             obs = torch.tensor(buffer.obs[name], dtype=torch.float32)  # (batch, 16)
