@@ -3,7 +3,7 @@ collect_dataset.py
 
 Step 1 + 2 of the instructor's plan: drive a hand-written (non-RL) controller
 from many different start positions to many different goals across the whole
-map, and record the 16-value observation at EVERY step.
+map, and record the 20-value observation at EVERY step.
 
 Produces a dataset you can later use for:
   * Pattern A -- diverse reset states: sample (start, goal) pairs by difficulty
@@ -19,9 +19,11 @@ in the `odom` frame (it starts at 0,0 wherever the robot is) and compares it
 against a WORLD-frame goal. So observation values 13 (distance to goal) and
 14 (angle to goal) come out wrong.
 
-This collector rebuilds the SAME 16 values in the SAME order, but takes the
+This collector rebuilds the SAME values in the SAME order, but takes the
 position from Gazebo's ground-truth pose stream. Everything else is identical,
-so the dataset stays compatible with networks.py (OBS_DIM = 16).
+so the dataset stays compatible with networks.py (OBS_DIM = 20: 16 own values
+plus the 4-value communication slot, which is all zeros here because the
+scripted expert never transmits).
 
 Velocities (values 15, 16) are taken from odometry as before -- those are body
 -frame speeds and are correct regardless of where the odom origin sits.
@@ -67,6 +69,7 @@ from jetbot_env import (
     ROBOT_RADIUS,
     CONTACT_DIST,
 )
+from networks import MSG_DIM
 import scripted_nav_eval as snav
 
 # ---------------------------------------------------------------------------
@@ -94,10 +97,12 @@ DEFAULT_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'nav_data
 
 
 # ---------------------------------------------------------------------------
-# Observation -- same 16 values as jetbot_env, but with a correct position
+# Observation -- same values as jetbot_env, but with a correct position
 # ---------------------------------------------------------------------------
 def build_observation(scan, odom, world_pose, goal):
-    """Returns the 16-value observation, in exactly jetbot_env's order."""
+    """Returns the 20-value observation, in exactly jetbot_env's order:
+    12 LIDAR sectors, goal distance, goal angle, vx, vz, then the 4-value
+    communication slot (always silent here -- see the note at the end)."""
     ranges = scan.ranges
     n = len(ranges)
     sector_size = max(1, n // NUM_LIDAR_SECTORS)
@@ -126,6 +131,13 @@ def build_observation(scan, odom, world_pose, goal):
         vx,
         vz,
     ]
+    # The communication slot, appended LAST exactly as jetbot_env does. The
+    # scripted expert never transmits, so every slot is the "silent" encoding:
+    # all zeros with the valid flag down. That is not padding -- it is the
+    # literal observation the agent would receive with nobody talking, so the
+    # cloned policy is a correct no-communication policy and can serve as the
+    # No-Comm arm of the No-Comm / Always-Comm / Learned-Gate comparison.
+    obs = obs + [0.0] * MSG_DIM
     return obs, dist
 
 
@@ -148,6 +160,43 @@ def expert_action(linear, angular):
         if d < best_d:
             best, best_d = a, d
     return best
+
+
+# ---------------------------------------------------------------------------
+# EXPERT MODE -- why the demonstrations are now driven with discrete actions
+# ---------------------------------------------------------------------------
+# The first behavioural-cloning attempt reached 94.9% validation accuracy and
+# produced a robot that spun in place. The labels were right; the trajectory
+# behind them was not reproducible.
+#
+# The scripted controller commands continuous velocities: up to MAX_ANG = 1.0
+# rad/s while still driving at up to MAX_LIN = 0.15 m/s. The agent has four
+# fixed choices, and its turns are (0.05, +/-0.6) -- it can never turn faster
+# than 0.6 rad/s, and turning drops it to a third of cruise speed. So a
+# recorded state labelled "turn left" was reached by a robot turning at 0.8
+# rad/s while moving at 0.13 m/s; the agent executing that same label turns at
+# 0.6 and crawls at 0.05. Within a few steps it is somewhere the expert never
+# went, the cloned policy has never seen that state, and it degenerates.
+#
+# The fix is to stop demonstrating actions the learner cannot perform. In the
+# discrete modes the controller still plans and steers exactly as before, but
+# what actually reaches the wheels is DISCRETE_ACTIONS[a] -- so every recorded
+# trajectory is one the agent could have produced itself.
+#
+#   'hold'       pick the action at each recording boundary and hold it for the
+#                whole sample window. This matches the agent exactly: one env
+#                step = ACTION_REPEAT LIDAR cycles with a single action held
+#                throughout, which is TICKS_PER_SAMPLE ticks here. The default.
+#   'tick'       re-pick every control tick. Velocities are in-set, but the
+#                expert still changes action TICKS_PER_SAMPLE times per
+#                recorded sample, which the agent cannot do. Fallback if 'hold'
+#                turns out too coarse to complete episodes.
+#   'continuous' the original behaviour, kept so the failure is reproducible
+#                and so the two can be compared in the write-up.
+#
+# The expert gets slower and jerkier under 'hold'. That is the intended trade:
+# a mediocre expert the agent can copy beats a perfect one it cannot.
+EXPERT_MODES = ('hold', 'tick', 'continuous')
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +381,8 @@ def place_goal_markers(goals):
 # ---------------------------------------------------------------------------
 # One episode
 # ---------------------------------------------------------------------------
-def run_episode(node, agents, gt, scenarios, episode_id, random_yaw_prob):
+def run_episode(node, agents, gt, scenarios, episode_id, random_yaw_prob,
+                expert_mode='hold'):
     starts = {n: scenarios[n][0] for n in AGENTS}
     goals = {n: scenarios[n][1] for n in AGENTS}
     paths = {n: scenarios[n][2] for n in AGENTS}
@@ -356,6 +406,11 @@ def run_episode(node, agents, gt, scenarios, episode_id, random_yaw_prob):
     snav.spin_for(node, 0.4)
 
     wp_idx = {n: 0 for n in AGENTS}
+    cmd = {n: [0.0, 0.0] for n in AGENTS}
+    # The discrete action currently being executed, in 'hold' mode. Re-decided
+    # at each recording boundary and held for the whole sample window, which is
+    # how the agent experiences one env step.
+    held_action = {n: None for n in AGENTS}
     done = {n: False for n in AGENTS}
     samples = []
     step_in_ep = {n: 0 for n in AGENTS}
@@ -399,11 +454,15 @@ def run_episode(node, agents, gt, scenarios, episode_id, random_yaw_prob):
                 done[name] = True
                 continue
 
+            path = paths[name]
+            target = path[wp_idx[name]]
+            ang_err, dist_wp = snav.angle_and_dist_to(px, py, yaw, target)
+            if dist_wp <= snav.WAYPOINT_TOL and wp_idx[name] < len(path) - 1:
+                wp_idx[name] += 1
+                target = path[wp_idx[name]]
+                ang_err, dist_wp = snav.angle_and_dist_to(px, py, yaw, target)
+
             # --- contact check (same geometry jetbot_env uses) --------------
-            # Every tick, not just on decision ticks, so a brief scrape
-            # between two decisions cannot slip through unnoticed. Does not
-            # depend on which action is active, so it stays outside the
-            # `record` gate below.
             clear = wall_clearance(px, py)
             other_pose = poses['jb_1' if name == 'jb_0' else 'jb_0']
             if other_pose is not None:
@@ -416,42 +475,6 @@ def run_episode(node, agents, gt, scenarios, episode_id, random_yaw_prob):
                 touching[name] = True
             else:
                 touching[name] = False
-
-            if not record:
-                # Between decisions the robot keeps running the Twist already
-                # published below -- exactly what jetbot_env.py does for its
-                # ACTION_REPEAT window (it does not re-publish every tick
-                # either). Nothing new to decide or send yet.
-                continue
-
-            # ------------------------------------------------------------
-            # THE FIX -- see decisions-and-learnings.md / gating/README.md
-            # history. The old code below this point computed a smooth,
-            # continuously rate-limited command (turn rate up to
-            # snav.MAX_ANG = 1.0 rad/s) and only discretised it into one of
-            # jetbot_env.DISCRETE_ACTIONS AFTER driving it, purely to pick a
-            # label. But DISCRETE_ACTIONS caps the agent's own turn rate at
-            # 0.6 rad/s -- the expert was demonstrating turns the deployed
-            # agent physically cannot perform. BC then cloned those
-            # observations perfectly (94.9% val accuracy) and, once
-            # deployed, applied its learned "turn right" at 0.6 instead of
-            # the 1.0 it was trained against, read the result as "still not
-            # turned enough", and repeated forever -- the spin-in-place loop
-            # both train_mappo.py and evaluate_policy.py hit. Confirmed from
-            # the dataset: expert vz spanned +-1.0, the agent's is +-0.6.
-            #
-            # The fix: decide a DISCRETE action here, before touching the
-            # motors, and publish its EXACT (lin, ang) unmodified -- no
-            # rate limiting. The dataset can then never contain a state
-            # reached by motion the agent cannot reproduce.
-            # ------------------------------------------------------------
-            path = paths[name]
-            target = path[wp_idx[name]]
-            ang_err, dist_wp = snav.angle_and_dist_to(px, py, yaw, target)
-            if dist_wp <= snav.WAYPOINT_TOL and wp_idx[name] < len(path) - 1:
-                wp_idx[name] += 1
-                target = path[wp_idx[name]]
-                ang_err, dist_wp = snav.angle_and_dist_to(px, py, yaw, target)
 
             lin_t, ang_t = snav.desired_command(ang_err, dist_to_goal)
 
@@ -471,30 +494,53 @@ def run_episode(node, agents, gt, scenarios, episode_id, random_yaw_prob):
                         (gap - snav.AGENT_EMERGENCY_RADIUS) / span)
                     lin_t *= max(snav.YIELD_MIN_SPEED_FRACTION, min(1.0, slow))
 
-            # Snap the CONTINUOUS intent (lin_t, ang_t) to the nearest of the
-            # 4 real actions, then execute THAT action's exact values. This
-            # is the command now, not a label computed after the fact.
-            action_id = expert_action(lin_t, ang_t)
-            lin, ang = DISCRETE_ACTIONS[action_id]
+            lin = snav.rate_limit(cmd[name][0], lin_t, snav.ACCEL_LIN * snav.CONTROL_DT)
+            ang = snav.rate_limit(cmd[name][1], ang_t, snav.ACCEL_ANG * snav.CONTROL_DT)
+            # cmd[] stays the CONTINUOUS controller state. The rate limiter
+            # models actuator acceleration and needs a smooth signal to work
+            # against; discretising it here would make it chatter. The
+            # discretisation happens at the output only, below.
+            cmd[name] = [lin, ang]
+
+            # Which action the expert is executing this tick.
+            #   hold  -> decided at the recording boundary, held until the next
+            #   tick  -> re-decided every tick
+            # In both cases the wheels receive that action's velocities, so the
+            # demonstrated motion is inside the agent's action space.
+            if expert_mode == 'hold':
+                if record or held_action[name] is None:
+                    held_action[name] = expert_action(lin, ang)
+                action_id = held_action[name]
+            else:
+                action_id = expert_action(lin, ang)
+
+            if expert_mode == 'continuous':
+                out_lin, out_ang = lin, ang
+            else:
+                out_lin, out_ang = DISCRETE_ACTIONS[action_id]
 
             twist = Twist()
-            twist.linear.x = lin
-            twist.angular.z = ang
+            twist.linear.x = out_lin
+            twist.angular.z = out_ang
             agent.cmd_pub.publish(twist)
 
-            obs, d = build_observation(agent.latest_scan, agent.latest_odom,
-                                        poses[name], goals[name])
-            samples.append({
-                'obs': obs,
-                'action': action_id,
-                'x': px, 'y': py, 'yaw': yaw,
-                'gx': goals[name][0], 'gy': goals[name][1],
-                'dist': d,
-                'agent': 0 if name == 'jb_0' else 1,
-                'episode': episode_id,
-                'step': step_in_ep[name],
-            })
-            step_in_ep[name] += 1
+            if record:
+                obs, d = build_observation(agent.latest_scan, agent.latest_odom,
+                                            poses[name], goals[name])
+                samples.append({
+                    'obs': obs,
+                    # The action actually executed, not the continuous command
+                    # it was derived from -- otherwise the label would once
+                    # again describe motion the agent cannot reproduce.
+                    'action': action_id,
+                    'x': px, 'y': py, 'yaw': yaw,
+                    'gx': goals[name][0], 'gy': goals[name][1],
+                    'dist': d,
+                    'agent': 0 if name == 'jb_0' else 1,
+                    'episode': episode_id,
+                    'step': step_in_ep[name],
+                })
+                step_in_ep[name] += 1
 
     for agent in agents.values():
         agent.publish_stop()
@@ -583,6 +629,13 @@ def main():
     ap.add_argument('--max-attempt-factor', type=float, default=3.0,
                     help='give up after episodes x this many attempts '
                          '(rejected runs still cost time)')
+    ap.add_argument('--expert-mode', choices=EXPERT_MODES, default='hold',
+                    help="what actually reaches the wheels. 'hold' (default) "
+                         "drives the agent's own 4 discrete actions, one held "
+                         "per sample window -- demonstrations the agent can "
+                         "reproduce. 'tick' re-picks every control tick. "
+                         "'continuous' is the original behaviour, which is "
+                         "what made the first BC attempt spin.")
     ap.add_argument('--dry-run', action='store_true',
                     help='run a few episodes without writing the dataset')
     args = ap.parse_args()
@@ -644,7 +697,8 @@ def main():
                 continue
 
             new, done, starts, goals, contacts, min_clear = run_episode(
-                node, agents, gt, scen, ep_offset + accepted, args.random_yaw_prob)
+                node, agents, gt, scen, ep_offset + accepted, args.random_yaw_prob,
+                expert_mode=args.expert_mode)
 
             both_reached = all(done[n] for n in AGENTS)
             total_contacts = sum(contacts[n] for n in AGENTS)

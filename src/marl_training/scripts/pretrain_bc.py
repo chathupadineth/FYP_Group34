@@ -41,7 +41,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from networks import Actor, Critic, OBS_DIM, ACTION_DIM
+from networks import Actor, Critic, OBS_DIM, ACTION_DIM, OWN_OBS_DIM
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA = os.path.join(HERE, 'nav_dataset.npz')
@@ -259,6 +259,24 @@ def main():
                 f"\n{CHECKPOINT_DIR} already holds a run ({name} exists).\n"
                 f"Archive it first so a finished run is never silently overwritten:\n"
                 f"    mv checkpoints checkpoints_<something>\n")
+
+    # ---- Zero the communication columns before saving -------------------
+    # The dataset's message slot is all zeros on every sample (the scripted
+    # expert never transmits), so the gradient reaching fc1.weight[:, 16:20] is
+    # exactly zero on every step -- those four columns finish training still
+    # holding their RANDOM INITIALISATION. nn.Linear(20, 64) initialises to
+    # uniform(-0.224, 0.224), mean |w| ~= 0.112, which is the same order as the
+    # weights the clone actually learned. So the moment the gate is switched on
+    # and real messages arrive, four randomly-weighted inputs hit the network
+    # and the cloned policy is corrupted by noise it was never trained against.
+    #
+    # Zeroing them makes the clone a true no-communication policy: messages
+    # contribute exactly nothing until PPO decides otherwise. Same reasoning as
+    # migrate_checkpoint.py's zero-init, for the same reason.
+    with torch.no_grad():
+        actor.fc1.weight[:, OWN_OBS_DIM:].zero_()
+    print(f"  message columns [{OWN_OBS_DIM}:{OBS_DIM}] zeroed "
+          f"(the clone is a no-communication policy)")
 
     torch.save(actor.state_dict(), os.path.join(CHECKPOINT_DIR, 'actor_latest.pt'))
     torch.save(Critic().state_dict(), os.path.join(CHECKPOINT_DIR, 'critic_latest.pt'))

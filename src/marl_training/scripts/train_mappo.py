@@ -39,7 +39,7 @@ CURRICULUM = [1.0, 1.5, 2.0, 2.5, 3.0, None]     # None = no limit
 # giving one rung more training time without risking a jump to the next one
 # mid-run: the rolling success rate is still computed and logged, it just
 # never triggers a promotion.
-PROMOTE_ENABLED = False
+PROMOTE_ENABLED = True
 
 # Promotion is driven by RESULTS, not by update number. Advancing on a fixed
 # schedule is how a curriculum kills a run: if the policy is still weak at 1.0
@@ -58,7 +58,26 @@ LEARNING_RATE = 5e-4
 # ---------------------------------------------------------------------------
 # Set False to run exactly the pre-gating environment: no messages, every
 # slot stays zero, and the observation's last 4 values are constant.
-USE_GATE = True
+#
+# OFF for the BC run. Get a policy that navigates first; communication is a
+# second problem and stacking it on top of an unsolved first one made both
+# unmeasurable -- 46 updates went by with the gate at a flat 49% talk rate
+# because there was nothing for it to learn about yet.
+#
+# With this False, env.step() receives comm=None, _exchange_messages leaves
+# every slot at [0,0,0,0], and the four communication inputs are constant zero
+# for the whole run. A zero input contributes exactly nothing to a linear
+# layer, so the network behaves bit-for-bit like the 16-input pre-gating one.
+# The 256 actor / 512 critic weights on those columns receive zero gradient and
+# simply sit there.
+#
+# This is why OBS_DIM stays at 20 rather than reverting to 16: turning
+# communication back on later is then ONE LINE, with no checkpoint migration,
+# no re-widening of fc1, and no risk to whatever this run produces. The
+# architecture is identical either way; only the data flowing through it
+# differs. (pretrain_bc.py zeroes those columns before saving, so they start
+# at exactly 0.0 rather than at random init.)
+USE_GATE = False
 
 # Cost charged to a robot each step it chooses to TALK. Start at 0.0 and read
 # the talk rate off the log first -- a gate with no cost will simply always
@@ -90,11 +109,23 @@ COMM_COST = 0.0
 GATE_ENTROPY_COEF = 0.01
 GATE_LEARNING_RATE = 5e-4
 
-# Critic-only updates before the actor is touched. Needed when the actor came
-# from behavioural cloning and the critic is random. Continuing run 2 resumes a
-# critic that is already trained, so this is 0 -- warming up here would only
-# throw away 10 updates.
-CRITIC_WARMUP_UPDATES = 0
+# Critic-only updates before the actor is touched.
+#
+# Behavioural cloning trains the ACTOR and nothing else -- pretrain_bc.py writes
+# a fresh, random critic alongside it, because demonstrations contain no value
+# information. A random critic produces advantages that are pure noise, and PPO
+# will happily apply that noise to the actor. Within two or three updates the
+# cloned policy is gone and everything the demonstrations bought is spent.
+#
+# So the critic is allowed to catch up first: for this many updates PPO trains
+# the value function only and leaves the actor (and the gate) untouched.
+# 20 updates at PPO_EPOCHS = 10 is 200 gradient steps on the BC policy's own
+# state distribution, which is exactly the distribution the critic has to
+# evaluate.
+#
+# Set this to 0 when RESUMING a run whose critic is already trained -- warming
+# up there just throws away updates.
+CRITIC_WARMUP_UPDATES = 20
 
 CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), 'checkpoints')
 LOG_PATH = os.path.join(os.path.dirname(__file__), 'training_log.csv')
