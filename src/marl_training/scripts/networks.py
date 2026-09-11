@@ -1,7 +1,12 @@
 import torch
 import torch.nn as nn
 
-OBS_DIM = 16
+# 16 own values + 4 from the communication slot. The slot holds what the
+# OTHER robot told us this step, already relative and normalised
+# (gating/features.py gate_features); all four are zero when it stayed silent.
+OWN_OBS_DIM = 16
+MSG_DIM = 4
+OBS_DIM = OWN_OBS_DIM + MSG_DIM        # 20
 ACTION_DIM = 4
 HIDDEN_DIM = 64
 
@@ -22,7 +27,7 @@ class Actor(nn.Module):
     def init_hidden(self, batch_size):
         return torch.zeros(1, batch_size, HIDDEN_DIM)
 
-CENTRAL_OBS_DIM = 32  # both agents' 16-value observations concatenated
+CENTRAL_OBS_DIM = 2 * OBS_DIM   # 40 -- both agents' observations concatenated
 
 
 class Critic(nn.Module):

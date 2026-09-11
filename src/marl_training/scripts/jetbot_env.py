@@ -15,6 +15,7 @@ from spawn_utils import (
     PLATFORM_Y_MIN, PLATFORM_Y_MAX,
 )
 from pose_source import PoseSource
+from gating.features import AgentState, gate_features
 
 NUM_LIDAR_SECTORS = 12
 MAX_LIDAR_RANGE = 12.0     # the sensor's own maximum -- clamp and "nothing in range" fallback
@@ -53,6 +54,27 @@ COLLISION_PENALTY = -10.0
 # distance the policy has ever seen.
 GOAL_DIST_NORM = 3.2
 COLLISION_DIST = 0.20      # legacy LIDAR threshold -- no longer used for collisions
+
+# ---------------------------------------------------------------------------
+# GATE INPUT SCALING
+# ---------------------------------------------------------------------------
+# How many silent steps count as "my information is completely out of date".
+# Beyond this the staleness input saturates at 1.0 -- past ~20 control steps
+# the last message is useless whether it is 20 or 200 steps old, so there is
+# nothing left for the gate to discriminate.
+#
+# Why 20 and not MAX_EPISODE_STEPS (200): at the current ~50% talk rate a robot
+# hears something every 1-2 steps. Dividing by 200 would squash every real
+# value into 0.005-0.01 and the gate would never see this input move -- exactly
+# the failure LIDAR_NORM = 12.0 caused for the obstacle inputs. 20 keeps the
+# decision-relevant range spread across 0.05-1.0.
+STALENESS_NORM = 20.0
+
+# The nearest obstacle, in metres, that still counts as "tight". Contact is at
+# ~0.114 m and the room is ~3 m across, so 1.0 m puts the range that actually
+# matters (0.15-1.0 m) across most of 0..1. LIDAR_NORM = 3.5 would have
+# compressed it into 0.04-0.29 instead.
+GATE_CLEARANCE_NORM = 1.0
 
 # ---------------------------------------------------------------------------
 # COLLISION DETECTION -- from the map, not the LIDAR
@@ -157,6 +179,115 @@ class MultiJetBotEnv:
         self.prev_distance = {'jb_0': None, 'jb_1': None}
         self.collision_events = {'jb_0': 0, 'jb_1': 0}
 
+        # COMMUNICATION SLOTS
+        # msg_slot[name] is the 4-value block appended to THAT robot's
+        # observation: what the OTHER robot told it, already relative and
+        # normalised. All zeros means the other robot stayed silent, which is
+        # a distinct input from "it spoke and the distance happens to be 0"
+        # -- the fourth value is the valid flag that separates the two.
+        self.msg_slot = {'jb_0': [0.0] * 4, 'jb_1': [0.0] * 4}
+        # What each gate looks at when deciding whether to transmit. Read by the
+        # training loop, which owns the gate network so PPO can collect its
+        # log-probs the same way it does for the actor. Assembled by
+        # _update_gate_input() -- see the comment there for why this is NOT
+        # msg_slot any more.
+        self.gate_input = {'jb_0': [0.0] * 4, 'jb_1': [0.0] * 4}
+        self.comm_sent = {'jb_0': False, 'jb_1': False}
+
+        # BELIEF MEMORY -- the state the staleness gate input is built from.
+        # last_rel_dist: the normalised relative distance from the last message
+        #   that actually arrived. Kept after the message stops arriving.
+        # steps_since_msg: how many steps ago that was. Climbs during silence.
+        # ever_heard: has anything arrived at all this episode.
+        # own_min_lidar: nearest obstacle in any direction, from this robot's
+        #   OWN LIDAR -- no ground truth, so the gate stays deployable.
+        self.last_rel_dist = {'jb_0': 0.0, 'jb_1': 0.0}
+        self.steps_since_msg = {'jb_0': 0, 'jb_1': 0}
+        self.ever_heard = {'jb_0': False, 'jb_1': False}
+        self.own_min_lidar = {'jb_0': 1.0, 'jb_1': 1.0}
+
+    def agent_state(self, name):
+        """World-frame (x, y, yaw, v) -- the message payload. World frame is
+        not optional here: two robots' odom frames have different origins and
+        cannot be compared. See pose_source.py."""
+        odom = self.agents[name].latest_odom
+        if odom is None:
+            return None
+        p = self.pose_source.world_pose(name, odom)
+        if p is None:
+            return None
+        return AgentState(p[0], p[1], p[2], odom.twist.twist.linear.x)
+
+    def _exchange_messages(self, comm):
+        """comm[name] is True if THAT robot transmitted this step.
+
+        A robot's slot is filled from the other robot's message, so jb_0's
+        slot depends on jb_1's gate decision, not its own. Silence leaves the
+        slot at zeros with the valid flag down.
+        """
+        states = {n: self.agent_state(n) for n in self.agents}
+        for name in self.agents:
+            other = 'jb_1' if name == 'jb_0' else 'jb_0'
+            ego = states[name]
+            spoke = bool(comm.get(other, False)) if comm else False
+            if ego is None or states[other] is None or not spoke:
+                self.msg_slot[name] = [0.0, 0.0, 0.0, 0.0]
+            else:
+                self.msg_slot[name] = gate_features(ego, states[other], True)
+        # ---- Belief bookkeeping: silence AGES information, it does not erase it
+        #
+        # The gate used to read msg_slot directly. msg_slot drops to all zeros
+        # the instant the other robot goes quiet, and GateNet is feedforward --
+        # fed [0,0,0,0] it returns the SAME logits every single time, because a
+        # constant input can only produce a constant output. At a ~50% talk rate
+        # that meant half of every gate decision was made blind, and two silent
+        # robots sat in a deadlock where neither input could ever change enough
+        # to justify speaking up.
+        #
+        # So the environment now remembers the last thing each robot heard and
+        # how long ago it heard it. steps_since_msg climbs on every silent step,
+        # which means the gate's input keeps moving even when nobody is talking.
+        # That is what gives it a gradient to learn against.
+        for name in self.agents:
+            if self.msg_slot[name][3] > 0.0:        # valid flag up -> it landed
+                self.last_rel_dist[name] = self.msg_slot[name][0]
+                self.steps_since_msg[name] = 0
+                self.ever_heard[name] = True
+            else:
+                # Bounded so the counter cannot run away over a long episode;
+                # anything past 2x the norm is already saturated at 1.0 anyway.
+                self.steps_since_msg[name] = min(self.steps_since_msg[name] + 1,
+                                                 int(STALENESS_NORM * 2))
+        self.comm_sent = {n: bool(comm.get(n, False)) if comm else False
+                          for n in self.agents}
+
+    def _update_gate_input(self):
+        """Assemble the 4 numbers GateNet decides from.
+
+        Must be called AFTER observations are built -- own_min_lidar comes from
+        the LIDAR sweep inside _build_observation.
+
+        Every value here is something a real robot could compute from its own
+        sensors and its own memory. Nothing about the other robot's true pose
+        leaks in. That constraint is not optional: unlike the critic, the gate
+        runs at execution time, so anything it reads has to survive deployment.
+        """
+        for name in self.agents:
+            self.gate_input[name] = [
+                # 0: what it last heard -- kept, not erased, when silence falls
+                self.last_rel_dist[name],
+                # 1: how out-of-date that is. The one input guaranteed to keep
+                #    changing when both robots are quiet.
+                min(self.steps_since_msg[name] / STALENESS_NORM, 1.0),
+                # 2: own nearest obstacle. Keeps moving as the robot moves, so
+                #    even a saturated staleness leaves something to react to.
+                self.own_min_lidar[name],
+                # 3: has anything arrived at all this episode. Separates "last
+                #    heard 1.2 m away, long ago" from "never heard anything",
+                #    which index 0 alone cannot do.
+                1.0 if self.ever_heard[name] else 0.0,
+            ]
+
     def _spin_until_fresh(self, timeout_sec=2.0):
         start = time.time()
         for agent in self.agents.values():
@@ -196,6 +327,15 @@ class MultiJetBotEnv:
         # reward any more (there is no unique -10.0 to look for). Callers read
         # this instead: how many times each robot has made contact this episode.
         self.collision_events = {'jb_0': 0, 'jb_1': 0}
+        # A new episode starts with nobody having said anything yet.
+        self.msg_slot = {'jb_0': [0.0] * 4, 'jb_1': [0.0] * 4}
+        self.gate_input = {'jb_0': [0.0] * 4, 'jb_1': [0.0] * 4}
+        self.comm_sent = {'jb_0': False, 'jb_1': False}
+        # Nobody has heard anything yet, so there is no belief to age.
+        self.last_rel_dist = {'jb_0': 0.0, 'jb_1': 0.0}
+        self.steps_since_msg = {'jb_0': 0, 'jb_1': 0}
+        self.ever_heard = {'jb_0': False, 'jb_1': False}
+        self.own_min_lidar = {'jb_0': 1.0, 'jb_1': 1.0}
         pos0, pos1, goal0, goal1 = sample_two_agents_and_goals(max_goal_distance=max_goal_distance)
         
         self._teleport('jb_0', pos0[0], pos0[1])
@@ -211,7 +351,10 @@ class MultiJetBotEnv:
         for agent_name, agent in self.agents.items():
             self.pose_source.calibrate(agent_name, agent.latest_odom)
 
-        return {name: self._build_observation(name)[0] for name in self.agents}
+        obs = {name: self._build_observation(name)[0] for name in self.agents}
+        # After the observations, because own_min_lidar is filled in there.
+        self._update_gate_input()
+        return obs
 
     def _build_observation(self, name):
         agent = self.agents[name]
@@ -230,12 +373,14 @@ class MultiJetBotEnv:
 
         sectors = []
         relevant_min_dist = MAX_LIDAR_RANGE
+        nearest_obstacle = MAX_LIDAR_RANGE   # any direction -- for the gate input
         for i in range(NUM_LIDAR_SECTORS):
             chunk = ranges[i*sector_size:(i+1)*sector_size]
             chunk = [r for r in chunk if not math.isinf(r) and not math.isnan(r)]
             min_r = min(chunk) if chunk else MAX_LIDAR_RANGE
             min_r = min(min_r, MAX_LIDAR_RANGE)
             sectors.append(min(min_r / LIDAR_NORM, 1.0))
+            nearest_obstacle = min(nearest_obstacle, min_r)
 
             sector_center = angle_min + (i * sector_size + sector_size / 2.0) * angle_increment
             sector_center = math.atan2(math.sin(sector_center), math.cos(sector_center))
@@ -252,6 +397,11 @@ class MultiJetBotEnv:
         # must be too. odom.pose.pose.position is in the `odom` frame (origin
         # = wherever the robot started), and mixing the two made every
         # distance-to-goal and angle-to-goal wrong. See pose_source.py.
+        # Scaled on its own terms, not by LIDAR_NORM -- see GATE_CLEARANCE_NORM.
+        # This is the ONLY thing the gate learns about the world around it, so
+        # it has to arrive at a magnitude the network can actually see.
+        self.own_min_lidar[name] = min(nearest_obstacle / GATE_CLEARANCE_NORM, 1.0)
+
         gx, gy = self.goals[name]
         px, py, yaw = self.pose_source.world_pose(name, odom)
 
@@ -292,11 +442,20 @@ class MultiJetBotEnv:
             vx,
             vz,
         ]
+        # The communication slot is appended LAST so the first 16 values keep
+        # exactly the meaning and order the pre-gating checkpoints were trained
+        # on. migrate_checkpoint.py relies on that: it copies the old input
+        # weights into the first 16 columns and zeroes the new four.
+        obs = obs + list(self.msg_slot[name])
+
         # Third value is now the TRUE clearance in metres (was a normalised
         # LIDAR reading). Compare it against CONTACT_DIST, not COLLISION_DIST.
         return obs, dist, clearance
 
-    def step(self, actions: dict):
+    def step(self, actions: dict, comm: dict = None):
+        """comm[name] = True if that robot transmits this step. Pass None to
+        run with communication switched off entirely, which reproduces the
+        pre-gating environment exactly (every slot stays zero)."""
         for name, action_id in actions.items():
             if self.agent_done[name]:
                 self.agents[name].publish_stop()
@@ -307,6 +466,10 @@ class MultiJetBotEnv:
             self._spin_until_fresh()
 
         self.step_count += 1
+
+        # Messages are exchanged BEFORE observations are built, so the slot a
+        # robot acts on this step is the one it just received.
+        self._exchange_messages(comm)
 
         observations, rewards, dones = {}, {}, {}
         for name in self.agents:
@@ -350,6 +513,10 @@ class MultiJetBotEnv:
             dones[name] = done
             if done:
                 self.agent_done[name] = True
+
+        # Last, because it reads own_min_lidar, which _build_observation fills.
+        # What the training loop reads on the NEXT step to make its gate call.
+        self._update_gate_input()
 
         return observations, rewards, dones
 

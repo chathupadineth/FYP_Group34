@@ -7,7 +7,8 @@ import torch
 import torch.optim as optim
 
 from jetbot_env import MultiJetBotEnv
-from networks import Actor, Critic
+from networks import Actor, Critic, OBS_DIM
+from gating.gate_network import GateNet, SILENT, TALK
 from buffer import RolloutBuffer
 from gae import compute_gae
 from ppo_update import ppo_update
@@ -38,7 +39,7 @@ CURRICULUM = [1.0, 1.5, 2.0, 2.5, 3.0, None]     # None = no limit
 # giving one rung more training time without risking a jump to the next one
 # mid-run: the rolling success rate is still computed and logged, it just
 # never triggers a promotion.
-PROMOTE_ENABLED = True
+PROMOTE_ENABLED = False
 
 # Promotion is driven by RESULTS, not by update number. Advancing on a fixed
 # schedule is how a curriculum kills a run: if the policy is still weak at 1.0
@@ -51,6 +52,43 @@ ROLLOUT_LENGTH = 200      # steps collected per update (~1 episode's worth)
 NUM_UPDATES = 400
 CHECKPOINT_EVERY = 10
 LEARNING_RATE = 5e-4
+
+# ---------------------------------------------------------------------------
+# COMMUNICATION GATE
+# ---------------------------------------------------------------------------
+# Set False to run exactly the pre-gating environment: no messages, every
+# slot stays zero, and the observation's last 4 values are constant.
+USE_GATE = True
+
+# Cost charged to a robot each step it chooses to TALK. Start at 0.0 and read
+# the talk rate off the log first -- a gate with no cost will simply always
+# talk, and picking a penalty before seeing that number is the same guessing
+# that made LIDAR_NORM wrong twice.
+COMM_COST = 0.0
+
+# Exploration pressure on the gate specifically.
+#
+# WAS 0.05, on the reasoning that a two-way choice collapses faster than the
+# actor's four-way one. Measured over 46 updates, that was too high by a wide
+# margin -- and the log says so in numbers, not impressions:
+#
+#     entropy term  = 0.05 x ln(2) x 2 agents = 0.0693
+#     gate_loss     = -0.0710  (sd 0.0019 across all 46 updates)
+#     -> policy term  0.0017, i.e. 2.4% of the entropy term
+#
+# The gradient that should teach the gate anything was 40x weaker than the
+# bonus holding it at maximum entropy. talk_rate duly sat at 49.07% with a
+# linear slope of -0.022 percentage points per 100 updates -- a random walk,
+# not a policy. Its variance was 1.38x that of 400 fair coin flips per update,
+# which is the signature of weights drifting, not of learning.
+#
+# At 0.01 the entropy term drops to 0.0139, within reach of a policy term that
+# grows once the gate can actually discriminate (see the staleness inputs in
+# jetbot_env._update_gate_input). Not lower yet: with the gate still close to
+# random, a weak entropy bonus lets it collapse onto noise and call it a
+# decision.
+GATE_ENTROPY_COEF = 0.01
+GATE_LEARNING_RATE = 5e-4
 
 # Critic-only updates before the actor is touched. Needed when the actor came
 # from behavioural cloning and the critic is random. Continuing run 2 resumes a
@@ -89,9 +127,11 @@ def stage_label(stage):
     return 'unrestricted' if d is None else f'{d:.1f} m'
 
 
-def save_checkpoint(actor, critic, update_num, tag='latest'):
+def save_checkpoint(actor, critic, update_num, tag='latest', gate=None):
     torch.save(actor.state_dict(), os.path.join(CHECKPOINT_DIR, f'actor_{tag}.pt'))
     torch.save(critic.state_dict(), os.path.join(CHECKPOINT_DIR, f'critic_{tag}.pt'))
+    if gate is not None:
+        torch.save(gate.state_dict(), os.path.join(CHECKPOINT_DIR, f'gate_{tag}.pt'))
     if tag == 'latest':
         with open(os.path.join(CHECKPOINT_DIR, 'last_update.txt'), 'w') as f:
             f.write(str(update_num))
@@ -119,7 +159,18 @@ def main():
     actor_optimizer = optim.Adam(actor.parameters(), lr=LEARNING_RATE)
     critic_optimizer = optim.Adam(critic.parameters(), lr=LEARNING_RATE)
 
+    gate = GateNet() if USE_GATE else None
+    gate_optimizer = (optim.Adam(gate.parameters(), lr=GATE_LEARNING_RATE)
+                      if gate is not None else None)
+
     start_update = load_checkpoint(actor, critic)
+    if gate is not None:
+        gpath = os.path.join(CHECKPOINT_DIR, 'gate_latest.pt')
+        if os.path.exists(gpath):
+            gate.load_state_dict(torch.load(gpath))
+            print("Resumed gate from checkpoint")
+        else:
+            print("Gate starts fresh (random init)")
 
     env = MultiJetBotEnv()
 
@@ -131,7 +182,8 @@ def main():
                               'episodes_completed', 'goals_reached', 'collisions',
                               'critic_loss', 'actor_loss', 'elapsed_sec',
                               'active_steps_jb0', 'active_steps_jb1',
-                              'max_goal_distance', 'rolling_success_rate'])
+                              'max_goal_distance', 'rolling_success_rate',
+                              'talk_rate', 'gate_loss'])
 
     stage = load_stage()
     updates_on_stage = 0
@@ -156,6 +208,7 @@ def main():
         current_ep_reward = {'jb_0': 0.0, 'jb_1': 0.0}
         goals_reached = 0
         collisions = 0
+        talk_counts = {'jb_0': 0, 'jb_1': 0}
         prev_collision_events = dict(env.collision_events)
         action_counts = {'jb_0': [0, 0, 0, 0], 'jb_1': [0, 0, 0, 0]}
 
@@ -170,9 +223,25 @@ def main():
 
             actions = {}
             log_probs = {}
+            gate_obs = {}
+            gate_actions = {}
+            gate_log_probs = {}
             with torch.no_grad():
+                # The gate decides from what this robot currently knows about
+                # the other one -- the message slot it received last step.
+                if gate is not None:
+                    for name in ['jb_0', 'jb_1']:
+                        feat = list(env.gate_input[name])
+                        gate_obs[name] = feat
+                        glogits = gate(torch.tensor(feat, dtype=torch.float32))
+                        gdist = torch.distributions.Categorical(logits=glogits)
+                        ga = gdist.sample()
+                        gate_actions[name] = ga.item()
+                        gate_log_probs[name] = gdist.log_prob(ga).item()
+                        talk_counts[name] += int(ga.item() == TALK)
+
                 for name in ['jb_0', 'jb_1']:
-                    obs_tensor = torch.tensor(obs[name], dtype=torch.float32).view(1, 1, 16)
+                    obs_tensor = torch.tensor(obs[name], dtype=torch.float32).view(1, 1, OBS_DIM)
                     logits, actor_hidden[name] = actor(obs_tensor, actor_hidden[name])
                     dist = torch.distributions.Categorical(logits=logits.squeeze())
                     action = dist.sample()
@@ -180,15 +249,29 @@ def main():
                     log_probs[name] = dist.log_prob(action).item()
                     action_counts[name][action.item()] += 1
 
-                joint_obs_tensor = torch.tensor(joint_obs, dtype=torch.float32).view(1, 1, 32)
+                joint_obs_tensor = torch.tensor(joint_obs, dtype=torch.float32).view(1, 1, 2 * OBS_DIM)
                 values, critic_hidden_rollout = critic(joint_obs_tensor, critic_hidden_rollout)
                 values = values.squeeze().tolist()
 
-            next_obs, rewards, dones = env.step(actions)   
+            comm = ({n: gate_actions[n] == TALK for n in ['jb_0', 'jb_1']}
+                    if gate is not None else None)
+            next_obs, rewards, dones = env.step(actions, comm=comm)
+
+            # Talking costs something. At COMM_COST = 0.0 this is a no-op and
+            # the gate is free to chatter -- which is deliberate for the first
+            # run, so the natural talk rate can be measured before a penalty
+            # is chosen.
+            if gate is not None and COMM_COST:
+                for n in ['jb_0', 'jb_1']:
+                    if comm[n] and not env.agent_done[n]:
+                        rewards[n] -= COMM_COST
 
             episode_done = all(dones.values())
             buffer.add(obs, joint_obs, actions, log_probs, rewards, values, episode_done,
-                       active=active, agent_dones=dones)
+                       active=active, agent_dones=dones,
+                       gate_obs=gate_obs or None,
+                       gate_actions=gate_actions or None,
+                       gate_log_probs=gate_log_probs or None)
 
             for name in ['jb_0', 'jb_1']:
                 current_ep_reward[name] += rewards[name]
@@ -240,9 +323,11 @@ def main():
         # is given a head start on its own. Starting from scratch (no BC), the
         # actor is random anyway and the warmup costs nothing.
         warming_up = update <= start_update + CRITIC_WARMUP_UPDATES
-        critic_loss, actor_loss = ppo_update(
+        critic_loss, actor_loss, gate_loss = ppo_update(
             actor, critic, actor_optimizer, critic_optimizer,
-            buffer, advantages, returns, update_actor=not warming_up
+            buffer, advantages, returns, update_actor=not warming_up,
+            gate=gate, gate_optimizer=gate_optimizer,
+            gate_entropy_coef=GATE_ENTROPY_COEF
         )
 
         avg_r0 = sum(episode_rewards['jb_0']) / len(episode_rewards['jb_0']) if episode_rewards['jb_0'] else 0.0
@@ -267,6 +352,14 @@ def main():
         n = len(buffer)
         print(f"    active steps — jb_0: {act['jb_0']}/{n} ({100*act['jb_0']/max(1,n):.0f}%) | "
               f"jb_1: {act['jb_1']}/{n} ({100*act['jb_1']/max(1,n):.0f}%)")
+
+        talk_rate = 0.0
+        if gate is not None:
+            talk_rate = (talk_counts['jb_0'] + talk_counts['jb_1']) / max(1, 2 * n)
+            print(f"    gate — talk {100*talk_rate:.1f}% of steps "
+                  f"(jb_0 {100*talk_counts['jb_0']/max(1,n):.0f}%, "
+                  f"jb_1 {100*talk_counts['jb_1']/max(1,n):.0f}%) | "
+                  f"gate_loss={gate_loss:.4f} | comm_cost={COMM_COST}")
 
         # ----- Curriculum: promote on results, never on a fixed schedule -----
         episodes = len(episode_rewards['jb_0'])
@@ -297,12 +390,13 @@ def main():
                               goals_reached, collisions, critic_loss, actor_loss, elapsed,
                               act['jb_0'], act['jb_1'],
                               '' if CURRICULUM[stage] is None else CURRICULUM[stage],
-                              round(rolling_sr, 4)])
+                              round(rolling_sr, 4),
+                              round(talk_rate, 4), round(gate_loss, 4)])
         log_file.flush()
         os.fsync(log_file.fileno())
-        save_checkpoint(actor, critic, update, tag='latest')
+        save_checkpoint(actor, critic, update, tag='latest', gate=gate)
         if update % CHECKPOINT_EVERY == 0:
-            save_checkpoint(actor, critic, update, tag=f'update{update}')
+            save_checkpoint(actor, critic, update, tag=f'update{update}', gate=gate)
 
     for name in ['jb_0', 'jb_1']:
         # publish_action(3) is BACKWARD, not stop -- it used to drive both

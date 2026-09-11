@@ -64,9 +64,16 @@ def _masked_normalise(x, mask):
     return (x - mean) / (var.sqrt() + 1e-8)
 
 
+def _forward_gate(gate, feat_seq):
+    """The gate is feedforward, so the whole rollout goes through in one
+    call -- no hidden state to carry, unlike the actor and critic."""
+    return gate(feat_seq)
+
+
 def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer,
                advantages, returns, agent_names=('jb_0', 'jb_1'),
-               update_actor=True):
+               update_actor=True, gate=None, gate_optimizer=None,
+               gate_entropy_coef=None):
     """
     advantages, returns: dicts keyed by agent name, each a list matching buffer length
 
@@ -75,6 +82,13 @@ def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer,
     advantages are noise, and applying them would overwrite the cloned policy
     within a few updates. Letting the value function catch up first keeps the
     head start that cloning bought.
+
+    gate / gate_optimizer are optional. When given, the communication gate is
+    trained as a SECOND discrete head on the SAME advantages as the actor:
+    whether a robot spoke and how it moved both contributed to the same
+    outcome, so they share the credit. That is why GateNet emits two logits
+    rather than one sigmoid -- this reuses the Categorical machinery below
+    unchanged. The gate is skipped whenever the actor is (critic warmup).
     """
     joint_obs = torch.tensor(buffer.joint_obs, dtype=torch.float32)  # (batch, 32)
     dones = buffer.dones  # episode boundaries -> where the GRU state resets
@@ -102,6 +116,7 @@ def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer,
             actor_loss_total = torch.zeros(1)
             continue
         actor_loss_total = 0
+        gate_loss_total = 0 if gate is not None else None
         for name in agent_names:
             obs = torch.tensor(buffer.obs[name], dtype=torch.float32)  # (batch, 16)
             old_log_probs = torch.tensor(buffer.log_probs[name], dtype=torch.float32)
@@ -125,9 +140,34 @@ def ppo_update(actor, critic, actor_optimizer, critic_optimizer, buffer,
             policy_loss = -(torch.min(surr1, surr2) * m).sum() / n_active
             actor_loss_total += policy_loss - ENTROPY_COEF * entropy
 
+            # ----- Gate: same advantages, same clipped objective -----
+            if gate is not None and getattr(buffer, 'gate_actions', None):
+                gfeat = torch.tensor(buffer.gate_obs[name], dtype=torch.float32)
+                gact = torch.tensor(buffer.gate_actions[name], dtype=torch.long)
+                gold = torch.tensor(buffer.gate_log_probs[name], dtype=torch.float32)
+                glogits = _forward_gate(gate, gfeat)
+                gdist = torch.distributions.Categorical(logits=glogits)
+                gnew = gdist.log_prob(gact)
+                gent = (gdist.entropy() * m).sum() / n_active
+                gratio = torch.exp(gnew - gold)
+                gs1 = gratio * agent_advantages
+                gs2 = torch.clamp(gratio, 1 - CLIP_EPS, 1 + CLIP_EPS) * agent_advantages
+                gloss = -(torch.min(gs1, gs2) * m).sum() / n_active
+                ge = ENTROPY_COEF if gate_entropy_coef is None else gate_entropy_coef
+                gate_loss_total = gate_loss_total + gloss - ge * gent
+
         actor_optimizer.zero_grad()
         actor_loss_total.backward()
         torch.nn.utils.clip_grad_norm_(actor.parameters(), MAX_GRAD_NORM)
         actor_optimizer.step()
 
-    return critic_loss.item(), actor_loss_total.item()
+        if gate is not None and gate_optimizer is not None and \
+                isinstance(gate_loss_total, torch.Tensor):
+            gate_optimizer.zero_grad()
+            gate_loss_total.backward()
+            torch.nn.utils.clip_grad_norm_(gate.parameters(), MAX_GRAD_NORM)
+            gate_optimizer.step()
+
+    gate_val = (gate_loss_total.item()
+                if isinstance(gate_loss_total, torch.Tensor) else 0.0)
+    return critic_loss.item(), actor_loss_total.item(), gate_val

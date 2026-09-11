@@ -60,15 +60,28 @@ def relative_velocity(ego: AgentState, other: AgentState) -> float:
     return other.v - ego.v
 
 
-# NORMALISATION -- deliberately NOT done here yet. jetbot_env.py already
-# hit this exact failure mode once: LIDAR_NORM's comment explains that
-# leaving two inputs on very different scales (obstacle readings ~15x
-# quieter than the goal-angle input) made the policy learn to ignore the
-# quieter one entirely. relative_distance (raw metres) and relative_velocity
-# (raw m/s) are on different scales from relative_heading (already in
-# [-1, 1]) for the same reason. Don't guess a divisor -- pick one from real
-# curriculum logs the same way LIDAR_NORM=3.5 was picked, before training
-# the gate for real.
+# NORMALISATION -- measured, not guessed.
+#
+# LIDAR_NORM's history in jetbot_env.py is the cautionary tale: two inputs
+# 15x apart in magnitude meant the quieter one was ignored outright. So these
+# divisors were taken from 4,163 paired samples in nav_dataset.npz -- the same
+# scripted runs the dataset was collected from -- not picked by eye.
+#
+#   relative_distance   min 0.23   p50 1.59   p90 2.54   p99 3.09   max 3.41 m
+#   relative_velocity   min -0.150  p50 0.000  max 0.150 m/s
+#
+#   divisor      p50     std    clipped
+#   dist / 2.0   0.795   0.260   31.2%   <- throws away a third of the range
+#   dist / 3.0   0.530   0.228    1.5%   <- here
+#   dist / 4.0   0.398   0.173    0.0%   <- weaker signal for nothing gained
+#   relv / 0.15    -     0.290    0.0%   <- here; 0.15 is MAX_LIN, so this is
+#                                           exactly [-1, 1] by construction
+#
+# Result: distance std 0.228, velocity std 0.290, heading already in [-1, 1].
+# All three within ~1.3x of each other, against the 15x that caused the
+# original failure.
+REL_DIST_NORM = 3.0        # metres
+REL_VEL_NORM = 0.15        # m/s -- scripted_nav_eval.MAX_LIN
 
 
 def gate_features(ego: AgentState, other_or_none, msg_valid: bool):
@@ -88,9 +101,11 @@ def gate_features(ego: AgentState, other_or_none, msg_valid: bool):
     """
     if other_or_none is None or not msg_valid:
         return [0.0, 0.0, 0.0, 0.0]
+    d = min(relative_distance(ego, other_or_none) / REL_DIST_NORM, 1.0)
+    v = max(-1.0, min(1.0, relative_velocity(ego, other_or_none) / REL_VEL_NORM))
     return [
-        relative_distance(ego, other_or_none),
-        relative_velocity(ego, other_or_none),
+        d,
+        v,
         relative_heading(ego, other_or_none),
         1.0,
     ]

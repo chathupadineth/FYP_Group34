@@ -34,13 +34,29 @@ class RolloutBuffer:
         self.dones = []
         self.agent_dones = {'jb_0': [], 'jb_1': []}
         self.active = {'jb_0': [], 'jb_1': []}
+        # Communication gate: its own observation (the 4-value message slot),
+        # its own discrete action (0 silent / 1 talk) and its own log-prob.
+        # Kept separate from the navigation action so either head can be
+        # trained, or left out, without disturbing the other.
+        self.gate_obs = {'jb_0': [], 'jb_1': []}
+        self.gate_actions = {'jb_0': [], 'jb_1': []}
+        self.gate_log_probs = {'jb_0': [], 'jb_1': []}
 
     def add(self, obs_dict, joint_obs, actions, log_probs, rewards, value, done,
-            active=None, agent_dones=None):
+            active=None, agent_dones=None,
+            gate_obs=None, gate_actions=None, gate_log_probs=None):
         """`active` and `agent_dones` are optional dicts keyed by agent name.
         If omitted, every agent is assumed to be running and to share the
-        episode's done flag -- the old behaviour."""
+        episode's done flag -- the old behaviour.
+
+        The gate_* arguments are optional too: leave them out and the gate
+        lists stay empty, which is exactly what ppo_update checks for before
+        deciding whether to train a gate at all."""
         for name in self.AGENTS:
+            if gate_obs is not None:
+                self.gate_obs[name].append(list(gate_obs[name]))
+                self.gate_actions[name].append(int(gate_actions[name]))
+                self.gate_log_probs[name].append(float(gate_log_probs[name]))
             self.obs[name].append(obs_dict[name])
             self.actions[name].append(actions[name])
             self.log_probs[name].append(log_probs[name])
