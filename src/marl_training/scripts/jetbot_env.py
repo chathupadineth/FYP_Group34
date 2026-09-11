@@ -25,46 +25,33 @@ MAX_LIDAR_RANGE = 12.0     # the sensor's own maximum -- clamp and "nothing in r
 # goal-angle input spans -1..+1 (std ~0.5). The obstacle inputs were ~15x
 # quieter than the goal inputs, so the policy learned to ignore walls entirely:
 # 0% timeouts and 0.95x-optimal routes, but a 30% collision rate.
-# 3.5 was the first fix, chosen from ray-casts taken at RANDOM points on the
-# map. Real collected data then showed the robot never sees that far: following
-# A* routes at 0.16 m clearance it hugs obstacles, and 10 of the 12 sectors
-# never exceeded 1.27 m over a whole dataset. Measured on nav_dataset.npz:
+# ---------------------------------------------------------------------------
+# RESTORED TO RUN 2's SETTINGS so checkpoints_run2_lidarfix_terminal can be
+# resumed. A checkpoint's weights only mean anything under the observation
+# scaling they were trained with -- load them under different constants and
+# every input arrives at the wrong magnitude, which is exactly how the BC
+# attempt failed.
 #
-#     LIDAR_NORM     mean      max     clipped
-#        12.0       0.034    0.106       0%     original, hopeless
-#         3.5       0.117    0.363       0%     first fix, still only 36% of range
-#         2.0       0.205    0.635       0%     <- here
-#
-# 2.0 nearly doubles the spread and still clips nothing, because the longest
-# reading actually observed (1.27 m) maps to 0.635. Anything beyond 2 m in a
-# 3 m room is "far" as far as obstacle avoidance is concerned.
-# Set this back to MAX_LIDAR_RANGE to evaluate a pre-fix checkpoint.
-LIDAR_NORM = 2.0
+# Run 2 used LIDAR_NORM = 3.5. Do NOT change it back to 2.0 while continuing
+# that run; start a fresh run if you want 2.0.
+#     12.0  run 1 (blind baseline)
+#      3.5  run 2  <- here
+#      2.0  the value measured data later showed is better, for a FUTURE run
+LIDAR_NORM = 3.5
 
-# Episodes used to run 200 steps, but with collisions no longer terminal a
-# robot survives to the cap almost every time, so a 200-step rollout became
-# ONE episode -- and any robot that reached its goal early spent the rest of
-# it as masked-out padding. 100 steps is still ~5x what a <=1 m goal needs
-# (~20 steps at 0.083 m/step) and gives roughly twice the episodes, i.e. twice
-# the fresh starts and twice the chances to see a goal.
-MAX_EPISODE_STEPS = 100
+MAX_EPISODE_STEPS = 200        # run 2's value
 GOAL_REACHED_DIST = 0.15
 
-# Touching a wall no longer ends the episode. The old terminal -10.0 made
-# contact a cliff: 91% of robot-runs died on it, so the policy saw a +10 goal
-# only once every ~526 steps and learned to freeze or turn away rather than
-# navigate. Now the robot is charged once per contact and carries on, so a
-# single episode can contain a mistake, a recovery, and a success -- which is
-# exactly the sequence it has to learn.
-COLLISION_PENALTY = -2.0
+# Run 2 ended an episode on first contact, with -10.0. Restored so the resumed
+# policy meets the same rules it was trained under. (The non-terminal -2.0
+# variant is still worth trying, but as a FRESH run, not a continuation.)
+COLLISION_TERMINAL = True
+COLLISION_PENALTY = -10.0
 
-# What distance-to-goal is divided by before it reaches the network.
-# It was 3.2, but the widest goal this map allows is 3.82 m, so every long
-# scenario -- the whole corner-to-corner phase of the dataset -- clipped to
-# exactly 1.0 and the network could not tell 3.2 m from 3.8 m. 4.0 covers the
-# map with a little headroom.
-# collect_dataset.py imports this, so the two can never drift apart.
-GOAL_DIST_NORM = 4.0
+# Run 2's value. 4.0 is better for long goals (the map reaches 3.82 m) but the
+# resumed network was trained against 3.2 -- changing it would rescale every
+# distance the policy has ever seen.
+GOAL_DIST_NORM = 3.2
 COLLISION_DIST = 0.20      # legacy LIDAR threshold -- no longer used for collisions
 
 # ---------------------------------------------------------------------------
@@ -346,14 +333,12 @@ class MultiJetBotEnv:
             if dist <= GOAL_REACHED_DIST:
                 reward = 10.0
                 done = True
-            elif is_colliding_now and not was_colliding:
-                # Charged ONCE, on the step the robot makes contact -- not for
-                # every step it stays touching. Charging per step would make a
-                # robot pinned against a wall accumulate a penalty far worse
-                # than the old terminal -10.0, which is the opposite of the
-                # intent.
-                reward = shaping_reward - 0.01 + COLLISION_PENALTY
-                self.collision_events[name] += 1
+            elif is_colliding_now:
+                reward = COLLISION_PENALTY
+                if not was_colliding:
+                    self.collision_events[name] += 1
+                if COLLISION_TERMINAL:
+                    done = True
 
             self.agent_colliding[name] = is_colliding_now
 

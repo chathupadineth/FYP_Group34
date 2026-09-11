@@ -132,11 +132,16 @@ def run_episode(env, actor, rng, stochastic, verbose, max_goal_distance):
             steps_taken[name] = t + 1
             if dones[name]:
                 finished[name] = True
-                # Collisions are no longer terminal, so an episode ends only at
-                # the goal or at the step cap. Contacts are counted separately
-                # and reported as a rate, which is what the thesis needs anyway:
-                # "did it arrive" and "how much did it hit" are now independent.
-                outcome[name] = 'GOAL' if rewards[name] >= 10.0 else 'TIMEOUT'
+                # Collisions are terminal again (run 2's rules), so a run ends
+                # as GOAL, COLLISION, or TIMEOUT. `hits` still comes from the
+                # env counter rather than the reward, so it stays correct
+                # whichever collision mode jetbot_env is in.
+                if rewards[name] >= 10.0:
+                    outcome[name] = 'GOAL'
+                elif rewards[name] <= -10.0:
+                    outcome[name] = 'COLLISION'
+                else:
+                    outcome[name] = 'TIMEOUT'
                 hits[name] = env.collision_events[name]
 
         if all(dones.values()):
@@ -206,9 +211,21 @@ def main():
               f"{'path':>7} {'optimal':>8} {'SPL':>6} {'hits':>5}")
 
     started = time.time()
+    completed = 0
+    aborted = None
+    # Gazebo has died mid-evaluation more than once after a long training run.
+    # Losing every finished episode to that is avoidable: keep what completed,
+    # report on it, and say plainly how far it got.
     for ep in range(1, args.episodes + 1):
-        runs = run_episode(env, actor, action_rng, args.stochastic,
-                           not args.quiet, max_goal_distance)
+        try:
+            runs = run_episode(env, actor, action_rng, args.stochastic,
+                               not args.quiet, max_goal_distance)
+        except (TimeoutError, KeyboardInterrupt) as exc:
+            aborted = ('interrupted by user'
+                       if isinstance(exc, KeyboardInterrupt)
+                       else f'simulator stopped responding ({exc})')
+            break
+        completed += 1
         all_runs.extend(runs)
         if not args.quiet:
             for r in runs:
@@ -217,9 +234,25 @@ def main():
                       f"{r['path']:>7.2f} {r['optimal']:>8.2f} {r['spl']:>6.2f} "
                       f"{r['hits']:>5}{flag}")
 
+    if aborted:
+        print(f"\n*** STOPPED after {completed}/{args.episodes} episodes: {aborted}")
+        if completed:
+            print("    The episodes below DID finish -- these numbers are real,")
+            print("    just from a smaller sample. Restart the simulator")
+            print("    (bash run_demo.sh --stop && bash run_demo.sh --fresh)")
+            print("    and re-run with a different --seed to add more.")
+
+    if not all_runs:
+        print("\nNo episodes completed -- nothing to report.")
+        try:
+            env.close()
+        except Exception:
+            pass
+        return
+
     n = len(all_runs)
     goals = sum(1 for r in all_runs if r['outcome'] == 'GOAL')
-    crashes = sum(1 for r in all_runs if r['hits'] > 0)      # runs that touched anything
+    crashes = sum(1 for r in all_runs if r['outcome'] == 'COLLISION')
     total_hits = sum(r['hits'] for r in all_runs)
     timeouts = sum(1 for r in all_runs if r['outcome'] == 'TIMEOUT')
     spl = sum(r['spl'] for r in all_runs) / max(1, n)
@@ -229,12 +262,11 @@ def main():
 
     print("\n" + "=" * 60)
     print(f"RESULTS  --  {args.policy} policy, {n} robot-runs "
-          f"({args.episodes} episodes)")
+          f"({completed} episodes"
+          f"{f' of {args.episodes} requested' if aborted else ''})")
     print("=" * 60)
     print(f"  Success rate  (SR) : {100*goals/n:5.1f}%   ({goals}/{n})")
-    print(f"  Collision rate(CR) : {100*crashes/n:5.1f}%   ({crashes}/{n} runs "
-          f"touched something at least once)")
-    print(f"  Contacts per run   : {total_hits/n:5.2f}   ({total_hits} total)")
+    print(f"  Collision rate(CR) : {100*crashes/n:5.1f}%   ({crashes}/{n})")
     print(f"  Timeout rate       : {100*timeouts/n:5.1f}%   ({timeouts}/{n})")
     print(f"  SPL                : {spl:5.3f}   (1.000 = always the shortest route)")
     if succ_steps:
@@ -273,9 +305,15 @@ def main():
           f"--max-goal-distance {args.max_goal_distance}")
     print("  (same seed = same scenarios, so the numbers are directly comparable)")
 
-    for a in env.agents.values():
-        a.publish_stop()
-    env.close()
+    try:
+        for a in env.agents.values():
+            a.publish_stop()
+    except Exception:
+        pass
+    try:
+        env.close()
+    except Exception:
+        pass
 
 
 if __name__ == '__main__':

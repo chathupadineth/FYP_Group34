@@ -34,6 +34,12 @@ from ppo_update import ppo_update
 # numbers, so each rung forces it to actually use the range sensor.
 CURRICULUM = [1.0, 1.5, 2.0, 2.5, 3.0, None]     # None = no limit
 
+# Set False to freeze the curriculum wherever it currently stands. Useful for
+# giving one rung more training time without risking a jump to the next one
+# mid-run: the rolling success rate is still computed and logged, it just
+# never triggers a promotion.
+PROMOTE_ENABLED = True
+
 # Promotion is driven by RESULTS, not by update number. Advancing on a fixed
 # schedule is how a curriculum kills a run: if the policy is still weak at 1.0
 # when update 150 arrives, moving it to 1.5 leaves it failing at both.
@@ -42,12 +48,15 @@ PROMOTE_WINDOW = 10         # updates in the rolling window
 PROMOTE_MIN_UPDATES = 15    # minimum time on a rung before promotion
 
 ROLLOUT_LENGTH = 200      # steps collected per update (~1 episode's worth)
-NUM_UPDATES = 300
+NUM_UPDATES = 400
 CHECKPOINT_EVERY = 10
 LEARNING_RATE = 5e-4
 
-# Critic-only updates before the actor is touched. See the call to ppo_update.
-CRITIC_WARMUP_UPDATES = 10
+# Critic-only updates before the actor is touched. Needed when the actor came
+# from behavioural cloning and the critic is random. Continuing run 2 resumes a
+# critic that is already trained, so this is 0 -- warming up here would only
+# throw away 10 updates.
+CRITIC_WARMUP_UPDATES = 0
 
 CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), 'checkpoints')
 LOG_PATH = os.path.join(os.path.dirname(__file__), 'training_log.csv')
@@ -271,7 +280,8 @@ def main():
               f"rolling SR (last {len(window)} updates) = {100*rolling_sr:.1f}% "
               f"({win_goals}/{win_runs} runs) | {updates_on_stage} updates on this rung")
 
-        if (stage < len(CURRICULUM) - 1
+        if (PROMOTE_ENABLED
+                and stage < len(CURRICULUM) - 1
                 and updates_on_stage >= PROMOTE_MIN_UPDATES
                 and len(window) == PROMOTE_WINDOW
                 and rolling_sr >= PROMOTE_SR):
